@@ -211,15 +211,25 @@ Read the digest. Confirm it contains real emails with working Gmail links. If us
 
 ### Step 4: Enrich Brain Pages
 
-This is YOUR job (the agent). Read the digest. For each email:
+Use the scaffold bridge first, then let the agent do deeper judgment work.
 
+```bash
+cd scripts/email-collector
+node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12
+```
+
+What the bridge does deterministically:
+1. resolves sender identity from the collected message
+2. finds or creates `people/<slug>.md`
+3. appends a sourced timeline entry for the email
+4. writes raw source data to `people/.raw/<slug>.json`
+
+Then the agent does the higher-judgment pass:
 1. **Detect entities**: who sent it? Who is mentioned? What companies?
 2. **Check the brain**: `gbrain search "sender name"` — do we have a page?
-3. **Update brain pages**: if sender has a brain page, append a timeline entry:
-   `- YYYY-MM-DD | Email from {sender}: {subject} [Source: Gmail, {date}]`
-4. **Create new pages**: if sender is notable and has no page, create one
-5. **Extract action items**: if the email requires a response or action, log it
-6. **Sync**: run `gbrain sync --no-pull --no-embed` to index changes
+3. **Update compiled truth** if the new email materially changes the state of play
+4. **Extract action items**: if the email requires a response or action, log it
+5. **Sync**: run `gbrain sync --no-pull --no-embed` to index changes
 
 ### Step 5: Set Up Cron
 

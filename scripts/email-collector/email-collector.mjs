@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { spawnSync } from 'child_process';
 
@@ -235,13 +235,115 @@ function digest(baseDir, dateArg) {
   return { date, total: records.length };
 }
 
+function parseSender(fromHeader) {
+  const match = String(fromHeader || '').match(/^(.*?)\s*<([^>]+)>$/);
+  if (match) {
+    return { displayName: match[1].trim(), email: match[2].trim().toLowerCase() };
+  }
+  const value = String(fromHeader || '').trim();
+  if (value.includes('@')) {
+    const name = value.split('@')[0].replace(/[._-]+/g, ' ').trim();
+    return { displayName: name.split(/\s+/).map(part => part ? part[0].toUpperCase() + part.slice(1) : '').join(' '), email: value.toLowerCase() };
+  }
+  return { displayName: value || 'Unknown Sender', email: '' };
+}
+
+function slugify(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'unknown-sender';
+}
+
+function parseAliases(content) {
+  const match = content.match(/aliases:\s*\[(.*?)\]/s);
+  if (!match) return [];
+  return match[1]
+    .split(',')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .map(part => part.replace(/^"|"$/g, ''));
+}
+
+function splitPage(content) {
+  const marker = '\n---\n';
+  const idx = content.indexOf(marker);
+  if (idx === -1) return { compiled: content.trim(), timeline: '' };
+  return {
+    compiled: content.slice(0, idx).trim(),
+    timeline: content.slice(idx + marker.length).trim(),
+  };
+}
+
+function findPersonPage(peopleDir, sender) {
+  if (!existsSync(peopleDir)) return null;
+  const files = readdirSync(peopleDir).filter(name => name.endsWith('.md'));
+  for (const file of files) {
+    const fullPath = join(peopleDir, file);
+    const content = readFileSync(fullPath, 'utf8');
+    const aliases = parseAliases(content);
+    if (aliases.includes(sender.email) || aliases.includes(sender.displayName)) {
+      return { slug: file.replace(/\.md$/, ''), path: fullPath, content };
+    }
+  }
+  return null;
+}
+
+function buildCompiledContent(sender, aliases, date) {
+  return `---\naliases: [${aliases.map(alias => `"${alias}"`).join(', ')}]\n---\n# ${sender.displayName}\n\n> Executive summary.\n\n## State\n- Last touched via email on ${date}\n\n## Open Threads\n- None\n\n## See Also\n- None`;
+}
+
+function appendTimelineEntry(existingTimeline, message, sender) {
+  const entry = `${normalizeDate(message.date)} | Email from ${message.from}: ${message.subject} [Source: Gmail, ${message.date}]`;
+  if (!existingTimeline) return entry;
+  if (existingTimeline.includes(entry)) return existingTimeline;
+  return `${existingTimeline.trim()}\n${entry}`;
+}
+
+function enrich(baseDir, brainDir, dateArg) {
+  if (!brainDir) throw new Error('--brain-dir is required for enrich');
+  const date = normalizeDate(dateArg);
+  const records = readJson(messagesPath(baseDir, date), []);
+  const peopleDir = join(resolve(brainDir), 'people');
+  const rawDir = join(peopleDir, '.raw');
+  ensureDir(peopleDir);
+  ensureDir(rawDir);
+
+  let updated = 0;
+  for (const message of records.filter(msg => !msg.is_noise)) {
+    const sender = parseSender(message.from);
+    const existing = findPersonPage(peopleDir, sender);
+    const slug = existing?.slug || slugify(sender.displayName);
+    const personPath = join(peopleDir, `${slug}.md`);
+    const rawPath = join(rawDir, `${slug}.json`);
+
+    const aliases = Array.from(new Set([sender.displayName, sender.email].filter(Boolean).concat(existing ? parseAliases(existing.content) : [])));
+    const existingContent = existing?.content || '';
+    const page = splitPage(existingContent);
+    const compiled = buildCompiledContent(sender, aliases, date);
+    const timeline = appendTimelineEntry(page.timeline, message, sender);
+    atomicWrite(personPath, `${compiled}\n\n---\n${timeline}\n`);
+
+    const raw = readJson(rawPath, { messages: [] });
+    if (!raw.messages.some(entry => entry.id === message.id)) {
+      raw.messages.push(message);
+    }
+    atomicWrite(rawPath, JSON.stringify(raw, null, 2));
+    updated += 1;
+  }
+
+  return { date, updated };
+}
+
 function printHelp() {
   console.log(`email-collector.mjs
 
 USAGE
   node email-collector.mjs init --dir <path>
   node email-collector.mjs collect --dir <path> --input <file.json> --account <email> [--date YYYY-MM-DD]
+  node email-collector.mjs collect --dir <path> --provider gws --gws-bin /opt/homebrew/bin/gws --account <email> [--date YYYY-MM-DD]
   node email-collector.mjs digest --dir <path> [--date YYYY-MM-DD]
+  node email-collector.mjs enrich --dir <collector-path> --brain-dir <brain-path> [--date YYYY-MM-DD]
 `);
 }
 
@@ -271,6 +373,12 @@ function main() {
     if (command === 'digest') {
       const result = digest(baseDir, args.date);
       console.log(`wrote digest for ${result.date} (${result.total} messages)`);
+      return;
+    }
+
+    if (command === 'enrich') {
+      const result = enrich(baseDir, args.brain_dir, args.date);
+      console.log(`enriched ${result.updated} people for ${result.date}`);
       return;
     }
 
