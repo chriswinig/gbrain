@@ -96,7 +96,7 @@ Every email gets a baked-in Gmail link: `[Open in Gmail](https://mail.google.com
 3. **Gmail access** via one of:
    - ClawVisor (recommended: E2E encrypted credential gateway)
    - Google OAuth credentials (direct API access)
-   - Hermes Gateway (built-in Gmail connector)
+   - Hermes Gateway / local authenticated `gws` CLI (built-in Gmail connector path)
 
 ## Setup Flow
 
@@ -172,9 +172,9 @@ Then run the OAuth flow to get tokens:
 Create the collector directory and script:
 
 ```bash
-mkdir -p email-collector/data/{messages,digests}
-cd email-collector
-npm init -y
+mkdir -p scripts/email-collector/data/{messages,digests}
+cd scripts/email-collector
+# no package init needed — the scaffold is a zero-dependency Node script in-repo
 ```
 
 The collector script needs these capabilities:
@@ -192,12 +192,14 @@ Key design rules for the collector:
 ### Step 3: Run First Collection
 
 ```bash
-node email-collector.mjs collect
-node email-collector.mjs digest
+cd scripts/email-collector
+# If gws is already authenticated locally, use it as the provider:
+node email-collector.mjs collect --dir . --provider gws --gws-bin /opt/homebrew/bin/gws --account you@example.com
+node email-collector.mjs digest --dir .
 ```
 
 Verify: `ls data/digests/` should show today's digest file.
-Read the digest. Confirm it contains real emails with working Gmail links.
+Read the digest. Confirm it contains real emails with working Gmail links. If using `gws`, this should work immediately without setting up a separate collector auth flow.
 
 ### Step 4: Enrich Brain Pages
 
@@ -216,7 +218,7 @@ This is YOUR job (the agent). Read the digest. For each email:
 The collector should run every 30 minutes:
 
 ```bash
-*/30 * * * * cd /path/to/email-collector && node email-collector.mjs collect && node email-collector.mjs digest
+*/30 * * * * cd /path/to/gbrain/scripts/email-collector && node email-collector.mjs collect --dir . --provider gws --gws-bin /opt/homebrew/bin/gws --account you@example.com && node email-collector.mjs digest --dir .
 ```
 
 The agent should read the digest on a schedule (e.g., 3x/day: 9 AM, 12 PM, 3 PM)
