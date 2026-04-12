@@ -225,4 +225,111 @@ else:
     expect(messages[0].body).toContain('Please review this.');
     expect(messages[0].gmail_link).toBe('https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/gws-1');
   });
+
+  test('enrich creates a person page and raw sidecar from collected email messages', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'm-1',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Design review tomorrow',
+        snippet: 'Can you review the deck?',
+        body: 'Please review the deck before tomorrow.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe('');
+
+    const personPath = join(brainDir, 'people', 'jane-doe.md');
+    const rawPath = join(brainDir, 'people', '.raw', 'jane-doe.json');
+    expect(existsSync(personPath)).toBe(true);
+    expect(existsSync(rawPath)).toBe(true);
+
+    const person = readFileSync(personPath, 'utf-8');
+    expect(person).toContain('aliases: ["Jane Doe", "jane@example.com"]');
+    expect(person).toContain('## State');
+    expect(person).toContain('Last touched via email on 2026-04-12');
+    expect(person).toContain('2026-04-12 | Email from Jane Doe <jane@example.com>: Design review tomorrow');
+    expect(person).toContain('[Source: Gmail, 2026-04-12T09:00:00Z]');
+
+    const raw = JSON.parse(readFileSync(rawPath, 'utf-8'));
+    expect(raw.messages).toHaveLength(1);
+    expect(raw.messages[0].id).toBe('m-1');
+  });
+
+  test('enrich updates existing person page by alias email without overwriting earlier timeline', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    const peopleDir = join(brainDir, 'people');
+    const rawDir = join(peopleDir, '.raw');
+    mkdirSync(rawDir, { recursive: true });
+    writeFileSync(join(peopleDir, 'jane-doe.md'), `---
+aliases: ["Jane Doe", "jane@example.com"]
+---
+# Jane Doe
+
+> Executive summary.
+
+## State
+- Existing note
+
+## Open Threads
+- None
+
+## See Also
+- None
+
+---
+2026-04-10 | Existing timeline entry [Source: Manual, 2026-04-10]
+`);
+
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'm-2',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Following up',
+        snippet: 'Checking in',
+        body: 'Just following up.',
+        date: '2026-04-12T11:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-2',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-2)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe('');
+
+    const person = readFileSync(join(peopleDir, 'jane-doe.md'), 'utf-8');
+    expect(person).toContain('2026-04-10 | Existing timeline entry');
+    expect(person).toContain('2026-04-12 | Email from Jane Doe <jane@example.com>: Following up');
+  });
 });
