@@ -18,6 +18,8 @@ const SIGNATURE_PATTERNS = [
 ];
 const COMPANY_SUFFIXES = new Set(['inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'co', 'labs', 'lab', 'ai', 'ventures', 'capital', 'group', 'studio', 'studios', 'systems', 'technologies', 'technology', 'partners', 'health', 'fitness']);
 const ENTITY_STOPWORDS = new Set(['Need', 'Review', 'Please', 'Thanks', 'Thank', 'Tomorrow', 'Today', 'Team', 'Brain', 'Email', 'Sync', 'This', 'That', 'Message', 'Messages', 'Page', 'Pages', 'Open', 'Threads', 'Executive', 'Summary', 'Last', 'Touched', 'Design', 'Kick', 'Import', 'Real']);
+const GENERIC_SENDER_LOCAL_PARTS = [/noreply/i, /no-reply/i, /notification/i, /support/i, /billing/i, /invoice/i, /statement/i, /receipt/i, /team/i, /info/i, /contact/i, /mail/i, /system/i, /security/i, /account/i, /acct_/i, /hello/i, /jobs/i, /careers/i];
+const PERSONAL_EMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'icloud.com', 'me.com', 'mac.com', 'yahoo.com', 'proton.me', 'protonmail.com', 'pm.me', 'aol.com']);
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -315,6 +317,41 @@ function parseSender(fromHeader) {
   return { displayName: value || 'Unknown Sender', email: '' };
 }
 
+function senderEmailParts(email) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized.includes('@')) return { local: '', domain: '', domainBase: '' };
+  const [local, domain] = normalized.split('@');
+  const domainParts = domain.split('.').filter(Boolean);
+  const domainBase = domainParts.length >= 2 ? domainParts[domainParts.length - 2] : domainParts[0] || '';
+  return { local, domain, domainBase };
+}
+
+function normalizeNameKey(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function senderEntityDir(sender) {
+  const displayName = normalizeEntityName(sender.displayName || '');
+  const { local, domain, domainBase } = senderEmailParts(sender.email);
+  const displayKey = normalizeNameKey(displayName);
+  const localKey = normalizeNameKey(local.split('+')[0] || '');
+  const domainKey = normalizeNameKey(domainBase);
+  const isPersonalDomain = PERSONAL_EMAIL_DOMAINS.has(domain);
+  const hasGenericLocal = GENERIC_SENDER_LOCAL_PARTS.some(pattern => pattern.test(local));
+  const domainMatchesDisplay = Boolean(displayKey && domainKey && domainKey === displayKey);
+  const localMatchesDisplay = Boolean(displayKey && localKey && localKey === displayKey);
+
+  if (looksLikePersonName(displayName)) return 'people';
+  if (displayName.includes(' ')) {
+    if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'companies';
+    return 'people';
+  }
+  if (isPersonalDomain && localMatchesDisplay) return 'people';
+  if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'companies';
+  if (localMatchesDisplay && !hasGenericLocal) return isPersonalDomain ? 'people' : 'people';
+  return sender.email ? 'companies' : 'people';
+}
+
 function slugify(text) {
   return String(text || '')
     .toLowerCase()
@@ -596,7 +633,8 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
   let updated = 0;
   for (const message of records.filter(msg => !msg.is_noise)) {
     const sender = parseSender(message.from);
-    upsertEntityPage(brainDir, 'people', sender.displayName, [sender.displayName, sender.email].filter(Boolean), date, message, 'sender');
+    const senderDir = senderEntityDir(sender);
+    upsertEntityPage(brainDir, senderDir, sender.displayName, [sender.displayName, sender.email].filter(Boolean), date, message, 'sender');
     updated += 1;
 
     const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
