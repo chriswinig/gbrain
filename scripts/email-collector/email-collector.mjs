@@ -420,7 +420,7 @@ function containsEntityMention(text, alias) {
 function listEntityPages(entityDir) {
   if (!existsSync(entityDir)) return [];
   return readdirSync(entityDir)
-    .filter(name => name.endsWith('.md'))
+    .filter(name => name.endsWith('.md') && name !== 'README.md')
     .map(file => {
       const path = join(entityDir, file);
       const content = readFileSync(path, 'utf8');
@@ -493,6 +493,38 @@ function resolveEntityDir(brainDir, entityKind) {
     }
   }
   throw new Error(`RESOLVER.md in ${resolve(brainDir)} does not define a target for entity kind: ${entityKind}`);
+}
+
+function readLocalResolver(brainDir, dirName) {
+  const readmePath = join(resolve(brainDir), dirName, 'README.md');
+  if (!existsSync(readmePath)) {
+    throw new Error(`Local resolver README.md not found for ${dirName}/ in brain root: ${resolve(brainDir)}`);
+  }
+  return readFileSync(readmePath, 'utf8');
+}
+
+function classifyLocalResolverKind(content) {
+  const lines = String(content || '').split('\n').map(line => line.trim()).filter(Boolean);
+  const descriptor = lines.find(line => /^one page per /i.test(line));
+  const lower = String(descriptor || '').toLowerCase();
+  if (lower.includes('one page per company or organization')) {
+    return 'company';
+  }
+  if (lower.includes('one page per human being')) {
+    return 'person';
+  }
+  return null;
+}
+
+function validateEntityAgainstLocalResolver(brainDir, dirName, entityKind) {
+  const readme = readLocalResolver(brainDir, dirName);
+  const localKind = classifyLocalResolverKind(readme);
+  if (!localKind) {
+    throw new Error(`Could not determine local resolver type for ${dirName}/ from README.md`);
+  }
+  if (localKind !== entityKind) {
+    throw new Error(`Local resolver mismatch: ${dirName}/ README.md expects ${localKind}, got ${entityKind}`);
+  }
 }
 
 function loadEntityCatalog(brainDir) {
@@ -686,13 +718,17 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
   let updated = 0;
   for (const message of records.filter(msg => !msg.is_noise)) {
     const sender = parseSender(message.from);
-    const senderDir = resolveEntityDir(brainDir, classifySenderEntityKind(sender));
+    const senderKind = classifySenderEntityKind(sender);
+    const senderDir = resolveEntityDir(brainDir, senderKind);
+    validateEntityAgainstLocalResolver(brainDir, senderDir, senderKind);
     upsertEntityPage(brainDir, senderDir, sender.displayName, [sender.displayName, sender.email].filter(Boolean), date, message, 'sender');
     updated += 1;
 
     const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
     for (const entity of mentions) {
-      const resolvedDir = resolveEntityDir(brainDir, entity.kind || (entity.dir === 'people' ? 'person' : 'company'));
+      const entityKind = entity.kind || (entity.dir === 'people' ? 'person' : 'company');
+      const resolvedDir = resolveEntityDir(brainDir, entityKind);
+      validateEntityAgainstLocalResolver(brainDir, resolvedDir, entityKind);
       upsertEntityPage(brainDir, resolvedDir, entity.name, entity.aliases || [entity.name], date, message, 'mention');
       updated += 1;
     }

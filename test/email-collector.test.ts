@@ -23,9 +23,34 @@ Is it about a company or organization (not a person)?
 \`\`\`
 `;
 
+const TEST_PEOPLE_README = `# people/
+
+One page per human being.
+
+## What goes here
+- Anyone Chris has a relationship with
+
+## What does NOT go here
+- Companies or organizations → companies/
+`;
+
+const TEST_COMPANIES_README = `# companies/
+
+One page per company or organization.
+
+## What goes here
+- Any company or organization Chris interacts with
+
+## What does NOT go here
+- Individual people at a company → people/
+`;
+
 function writeResolver(brainDir: string) {
-  mkdirSync(brainDir, { recursive: true });
+  mkdirSync(join(brainDir, 'people'), { recursive: true });
+  mkdirSync(join(brainDir, 'companies'), { recursive: true });
   writeFileSync(join(brainDir, 'RESOLVER.md'), TEST_RESOLVER);
+  writeFileSync(join(brainDir, 'people', 'README.md'), TEST_PEOPLE_README);
+  writeFileSync(join(brainDir, 'companies', 'README.md'), TEST_COMPANIES_README);
 }
 
 describe('email collector scaffold', () => {
@@ -419,6 +444,40 @@ else:
     const exitCode = await proc.exited;
     expect(exitCode).toBe(1);
     expect(stderr).toContain('RESOLVER.md not found');
+  });
+
+  test('enrich fails fast when local directory README conflicts with resolver output', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    writeFileSync(join(brainDir, 'companies', 'README.md'), `# companies/\n\nOne page per human being.\n`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'bad-local-resolver',
+        from: 'X <invoice+statements+acct_123@stripe.com>',
+        subject: 'Your receipt from X',
+        snippet: 'Receipt attached',
+        body: 'Your receipt from X for April.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/bad-local-resolver',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/bad-local-resolver)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('Local resolver mismatch');
   });
 
   test('enrich creates a person page and raw sidecar from collected email messages', async () => {
