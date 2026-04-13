@@ -16,6 +16,8 @@ const SIGNATURE_PATTERNS = [
   /everyone has signed/i,
   /you just signed/i,
 ];
+const COMPANY_SUFFIXES = new Set(['inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'co', 'labs', 'lab', 'ai', 'ventures', 'capital', 'group', 'studio', 'studios', 'systems', 'technologies', 'technology', 'partners', 'health', 'fitness']);
+const ENTITY_STOPWORDS = new Set(['Need', 'Review', 'Please', 'Thanks', 'Thank', 'Tomorrow', 'Today', 'Team', 'Brain', 'Email', 'Sync', 'This', 'That', 'Message', 'Messages', 'Page', 'Pages', 'Open', 'Threads', 'Executive', 'Summary', 'Last', 'Touched', 'Design', 'Kick', 'Import', 'Real']);
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -58,6 +60,15 @@ function messagesPath(baseDir, date) {
 
 function digestPath(baseDir, date) {
   return join(baseDir, 'data', 'digests', `${date}.md`);
+}
+
+function latestCollectedDate(baseDir) {
+  const dir = join(baseDir, 'data', 'messages');
+  if (!existsSync(dir)) return null;
+  const files = readdirSync(dir)
+    .filter(name => /^\d{4}-\d{2}-\d{2}\.json$/.test(name))
+    .sort();
+  return files.length ? files[files.length - 1].replace(/\.json$/, '') : null;
 }
 
 function defaultState() {
@@ -272,7 +283,7 @@ function formatSection(title, items) {
 
 function digest(baseDir, dateArg) {
   initCollector(baseDir);
-  const date = normalizeDate(dateArg);
+  const date = normalizeDate(dateArg || latestCollectedDate(baseDir));
   const records = readJson(messagesPath(baseDir, date), []);
 
   const signatures = records.filter(msg => msg.is_signature);
@@ -321,6 +332,135 @@ function parseAliases(content) {
     .map(part => part.replace(/^"|"$/g, ''));
 }
 
+function extractTitle(content) {
+  const match = String(content || '').match(/^#\s+(.+)$/m);
+  return match ? match[1].trim() : '';
+}
+
+function normalizeEntityName(text) {
+  const tokens = String(text || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  const collapsed = [];
+  for (const token of tokens) {
+    if (collapsed.length === 0 || collapsed[collapsed.length - 1].toLowerCase() !== token.toLowerCase()) {
+      collapsed.push(token);
+    }
+  }
+  return collapsed.join(' ').trim();
+}
+
+function escapeRegex(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isStopwordEntity(name) {
+  return normalizeEntityName(name).split(' ').some(token => ENTITY_STOPWORDS.has(token));
+}
+
+function looksLikeCompanyName(name) {
+  const normalized = normalizeEntityName(name).replace(/[.,]+$/g, '');
+  if (!normalized) return false;
+  const tokens = normalized.split(' ');
+  const last = tokens[tokens.length - 1].toLowerCase();
+  if (COMPANY_SUFFIXES.has(last)) return true;
+  return tokens.length === 1 && /[A-Z].*[A-Z]|[a-z][A-Z]/.test(normalized);
+}
+
+function looksLikePersonName(name) {
+  const normalized = normalizeEntityName(name).replace(/[.,]+$/g, '');
+  const tokens = normalized.split(' ');
+  if (tokens.length < 2 || tokens.length > 3) return false;
+  if (isStopwordEntity(normalized) || looksLikeCompanyName(normalized)) return false;
+  return tokens.every(token => /^[A-Z][a-z'’-]+$/.test(token));
+}
+
+function containsEntityMention(text, alias) {
+  const normalized = normalizeEntityName(alias);
+  if (!normalized) return false;
+  const pattern = new RegExp(`(^|[^A-Za-z0-9])${escapeRegex(normalized)}(?=$|[^A-Za-z0-9])`, 'i');
+  return pattern.test(text);
+}
+
+function listEntityPages(entityDir) {
+  if (!existsSync(entityDir)) return [];
+  return readdirSync(entityDir)
+    .filter(name => name.endsWith('.md'))
+    .map(file => {
+      const path = join(entityDir, file);
+      const content = readFileSync(path, 'utf8');
+      const title = extractTitle(content);
+      const aliases = Array.from(new Set([title].concat(parseAliases(content)).filter(Boolean).map(normalizeEntityName)));
+      return {
+        slug: file.replace(/\.md$/, ''),
+        path,
+        content,
+        title,
+        aliases,
+      };
+    });
+}
+
+function findEntityPage(entityDir, candidates) {
+  const wanted = new Set(candidates.filter(Boolean).map(candidate => normalizeEntityName(candidate).toLowerCase()));
+  if (wanted.size === 0) return null;
+  for (const page of listEntityPages(entityDir)) {
+    if (page.aliases.some(alias => wanted.has(alias.toLowerCase()))) {
+      return page;
+    }
+  }
+  return null;
+}
+
+function loadEntityCatalog(brainDir) {
+  const root = resolve(brainDir);
+  return ['people', 'companies'].flatMap(dirName => listEntityPages(join(root, dirName)).map(page => ({
+    dir: dirName,
+    slug: page.slug,
+    title: page.title,
+    aliases: page.aliases,
+  })));
+}
+
+function detectMentionedEntities(message, brainDir, sender) {
+  const text = [message.subject, message.snippet, message.body].filter(Boolean).join('\n');
+  const catalog = loadEntityCatalog(brainDir);
+  const matches = new Map();
+  const senderNames = new Set([sender.displayName, sender.email].filter(Boolean).map(value => normalizeEntityName(value).toLowerCase()));
+
+  for (const entity of catalog) {
+    if (entity.aliases.some(alias => senderNames.has(alias.toLowerCase()))) continue;
+    if (entity.aliases.some(alias => containsEntityMention(text, alias))) {
+      matches.set(`${entity.dir}:${entity.slug}`, {
+        dir: entity.dir,
+        name: entity.title || entity.aliases[0] || entity.slug,
+        aliases: entity.aliases,
+      });
+    }
+  }
+
+  const companyPattern = /\b([A-Z][A-Za-z0-9&.-]*(?:\s+[A-Z][A-Za-z0-9&.-]*){0,3}\s(?:Inc|LLC|Ltd|Corp|Corporation|Company|Co|Labs|Lab|AI|Ventures|Capital|Group|Studio|Studios|Systems|Technologies|Technology|Partners|Health|Fitness))\b/g;
+  for (const match of text.matchAll(companyPattern)) {
+    const candidate = normalizeEntityName(match[1]);
+    if (!candidate || isStopwordEntity(candidate)) continue;
+    matches.set(`companies:${slugify(candidate)}`, { dir: 'companies', name: candidate, aliases: [candidate] });
+  }
+
+  const personCuePattern = /\b(?:with|to|cc|include|loop in|introduce|met|meet|spoke with|talked to)\s+([A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+){1,2})\b/g;
+  for (const match of text.matchAll(personCuePattern)) {
+    const candidate = normalizeEntityName(match[1]);
+    if (!looksLikePersonName(candidate) || senderNames.has(candidate.toLowerCase())) continue;
+    matches.set(`people:${slugify(candidate)}`, { dir: 'people', name: candidate, aliases: [candidate] });
+  }
+
+  const companyCuePattern = /\b(?:at|via|from)\s+([A-Z][A-Za-z0-9&.-]*)\b/g;
+  for (const match of text.matchAll(companyCuePattern)) {
+    const candidate = normalizeEntityName(match[1]);
+    if (!candidate || isStopwordEntity(candidate) || senderNames.has(candidate.toLowerCase()) || !looksLikeCompanyName(candidate)) continue;
+    matches.set(`companies:${slugify(candidate)}`, { dir: 'companies', name: candidate, aliases: [candidate] });
+  }
+
+  return Array.from(matches.values());
+}
+
 function splitPage(content) {
   const marker = '\n---\n';
   const idx = content.indexOf(marker);
@@ -332,17 +472,7 @@ function splitPage(content) {
 }
 
 function findPersonPage(peopleDir, sender) {
-  if (!existsSync(peopleDir)) return null;
-  const files = readdirSync(peopleDir).filter(name => name.endsWith('.md'));
-  for (const file of files) {
-    const fullPath = join(peopleDir, file);
-    const content = readFileSync(fullPath, 'utf8');
-    const aliases = parseAliases(content);
-    if (aliases.includes(sender.email) || aliases.includes(sender.displayName)) {
-      return { slug: file.replace(/\.md$/, ''), path: fullPath, content };
-    }
-  }
-  return null;
+  return findEntityPage(peopleDir, [sender.email, sender.displayName].filter(Boolean));
 }
 
 function buildCompiledContent(sender, aliases, date) {
@@ -388,11 +518,52 @@ function mergeCompiledContent(existingCompiled, sender, aliases, date) {
   return compiled.trim();
 }
 
-function appendTimelineEntry(existingTimeline, message, sender) {
-  const entry = `${normalizeDate(message.date)} | Email from ${message.from}: ${message.subject} [Source: Gmail, ${message.date}]`;
+function appendUniqueTimelineEntry(existingTimeline, entry) {
   if (!existingTimeline) return entry;
   if (existingTimeline.includes(entry)) return existingTimeline;
   return `${existingTimeline.trim()}\n${entry}`;
+}
+
+function appendTimelineEntry(existingTimeline, message) {
+  const entry = `${normalizeDate(message.date)} | Email from ${message.from}: ${message.subject} [Source: Gmail, ${message.date}]`;
+  return appendUniqueTimelineEntry(existingTimeline, entry);
+}
+
+function appendMentionTimelineEntry(existingTimeline, message, entityName) {
+  const entry = `${normalizeDate(message.date)} | Mentioned in email from ${message.from}: ${entityName} — ${message.subject} [Source: Gmail, ${message.date}]`;
+  return appendUniqueTimelineEntry(existingTimeline, entry);
+}
+
+function upsertEntityPage(brainDir, dirName, entityName, aliases, date, message, mode) {
+  const entityDir = join(resolve(brainDir), dirName);
+  const rawDir = join(entityDir, '.raw');
+  ensureDir(entityDir);
+  ensureDir(rawDir);
+
+  const existing = findEntityPage(entityDir, [entityName].concat(aliases).filter(Boolean));
+  const slug = existing?.slug || slugify(entityName);
+  const entityPath = join(entityDir, `${slug}.md`);
+  const rawPath = join(rawDir, `${slug}.json`);
+  const existingContent = existing?.content || '';
+  const page = splitPage(existingContent);
+  const mergedAliases = Array.from(new Set([entityName]
+    .concat(aliases)
+    .concat(existing ? [extractTitle(existing.content)] : [])
+    .concat(existing ? parseAliases(existing.content) : [])
+    .filter(Boolean)
+    .map(normalizeEntityName)));
+  const compiled = mergeCompiledContent(page.compiled, { displayName: entityName }, mergedAliases, date);
+  const timeline = mode === 'sender'
+    ? appendTimelineEntry(page.timeline, message)
+    : appendMentionTimelineEntry(page.timeline, message, entityName);
+  atomicWrite(entityPath, `${compiled}\n\n---\n${timeline}\n`);
+
+  const raw = readJson(rawPath, { messages: [] });
+  if (!raw.messages.some(entry => entry.id === message.id)) {
+    raw.messages.push(message);
+  }
+  atomicWrite(rawPath, JSON.stringify(raw, null, 2));
+  return { slug, path: entityPath };
 }
 
 function runCommand(bin, args, cwd) {
@@ -419,34 +590,20 @@ function syncBrain(brainDir, gbrainBin, embedStale) {
 
 function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedStale) {
   if (!brainDir) throw new Error('--brain-dir is required for enrich');
-  const date = normalizeDate(dateArg);
+  const date = normalizeDate(dateArg || latestCollectedDate(baseDir));
   const records = readJson(messagesPath(baseDir, date), []);
-  const peopleDir = join(resolve(brainDir), 'people');
-  const rawDir = join(peopleDir, '.raw');
-  ensureDir(peopleDir);
-  ensureDir(rawDir);
 
   let updated = 0;
   for (const message of records.filter(msg => !msg.is_noise)) {
     const sender = parseSender(message.from);
-    const existing = findPersonPage(peopleDir, sender);
-    const slug = existing?.slug || slugify(sender.displayName);
-    const personPath = join(peopleDir, `${slug}.md`);
-    const rawPath = join(rawDir, `${slug}.json`);
-
-    const aliases = Array.from(new Set([sender.displayName, sender.email].filter(Boolean).concat(existing ? parseAliases(existing.content) : [])));
-    const existingContent = existing?.content || '';
-    const page = splitPage(existingContent);
-    const compiled = mergeCompiledContent(page.compiled, sender, aliases, date);
-    const timeline = appendTimelineEntry(page.timeline, message, sender);
-    atomicWrite(personPath, `${compiled}\n\n---\n${timeline}\n`);
-
-    const raw = readJson(rawPath, { messages: [] });
-    if (!raw.messages.some(entry => entry.id === message.id)) {
-      raw.messages.push(message);
-    }
-    atomicWrite(rawPath, JSON.stringify(raw, null, 2));
+    upsertEntityPage(brainDir, 'people', sender.displayName, [sender.displayName, sender.email].filter(Boolean), date, message, 'sender');
     updated += 1;
+
+    const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
+    for (const entity of mentions) {
+      upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases || [entity.name], date, message, 'mention');
+      updated += 1;
+    }
   }
 
   const syncResult = syncAfterEnrich ? syncBrain(brainDir, gbrainBin, embedStale) : null;
@@ -497,7 +654,7 @@ function main() {
     if (command === 'enrich') {
       const result = enrich(baseDir, args.brain_dir, args.date, Boolean(args.sync), args.gbrain_bin, Boolean(args.embed_stale));
       const suffix = result.sync ? ` + synced brain${result.sync.embed !== undefined ? ' + embedded stale chunks' : ''}` : '';
-      console.log(`enriched ${result.updated} people for ${result.date}${suffix}`);
+      console.log(`enriched ${result.updated} entity pages for ${result.date}${suffix}`);
       return;
     }
 

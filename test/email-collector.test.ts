@@ -175,6 +175,51 @@ describe('email collector scaffold', () => {
     expect(digest).toContain('[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/a)');
   });
 
+  test('digest and enrich default to the latest collected date when --date is omitted', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-11.json'), JSON.stringify([
+      {
+        id: 'latest-1',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Default date path',
+        snippet: 'Use the latest file',
+        body: 'Digest and enrich should use the latest collected date by default.',
+        date: '2026-04-11T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/latest-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/latest-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const digestProc = Bun.spawn(['node', scriptPath, 'digest', '--dir', dir], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const digestStdout = await new Response(digestProc.stdout).text();
+    const digestStderr = await new Response(digestProc.stderr).text();
+    expect(await digestProc.exited).toBe(0);
+    expect(digestStderr).toBe('');
+    expect(digestStdout).toContain('2026-04-11');
+    expect(existsSync(join(dir, 'data', 'digests', '2026-04-11.md'))).toBe(true);
+
+    const enrichProc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const enrichStdout = await new Response(enrichProc.stdout).text();
+    const enrichStderr = await new Response(enrichProc.stderr).text();
+    expect(await enrichProc.exited).toBe(0);
+    expect(enrichStderr).toBe('');
+    expect(enrichStdout).toContain('2026-04-11');
+    expect(existsSync(join(brainDir, 'people', 'jane-doe.md'))).toBe(true);
+  });
+
   test('collect with provider gws paginates list calls and writes richer gmail metadata', async () => {
     const dir = makeTempDir();
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
@@ -382,6 +427,69 @@ aliases: ["Jane Doe", "jane@example.com"]
     expect(person).toContain('- Existing note');
     expect(person).toContain('2026-04-10 | Existing timeline entry');
     expect(person).toContain('2026-04-12 | Email from Jane Doe <jane@example.com>: Following up');
+  });
+
+  test('enrich updates mentioned people and companies, not just the sender', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    const companyDir = join(brainDir, 'companies');
+    mkdirSync(companyDir, { recursive: true });
+    writeFileSync(join(companyDir, 'acme-corp.md'), `---
+aliases: ["Acme Corp"]
+---
+# Acme Corp
+
+> Existing company note.
+
+## State
+- Existing company state
+
+---
+2026-04-10 | Existing company timeline [Source: Manual, 2026-04-10]
+`);
+
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'm-mention',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Loop in Sarah Chen',
+        snippet: 'Please include Sarah Chen at Acme Corp',
+        body: 'Please include Sarah Chen at Acme Corp before tomorrow.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-mention',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-mention)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const stdout = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe('');
+    expect(stdout).toContain('enriched 3 entity pages');
+
+    const senderPage = readFileSync(join(brainDir, 'people', 'jane-doe.md'), 'utf-8');
+    const mentionedPerson = readFileSync(join(brainDir, 'people', 'sarah-chen.md'), 'utf-8');
+    const companyPage = readFileSync(join(brainDir, 'companies', 'acme-corp.md'), 'utf-8');
+    const companyRaw = JSON.parse(readFileSync(join(brainDir, 'companies', '.raw', 'acme-corp.json'), 'utf-8'));
+
+    expect(senderPage).toContain('Email from Jane Doe <jane@example.com>: Loop in Sarah Chen');
+    expect(mentionedPerson).toContain('Mentioned in email from Jane Doe <jane@example.com>: Sarah Chen — Loop in Sarah Chen');
+    expect(companyPage).toContain('> Existing company note.');
+    expect(companyPage).toContain('2026-04-10 | Existing company timeline');
+    expect(companyPage).toContain('Mentioned in email from Jane Doe <jane@example.com>: Acme Corp — Loop in Sarah Chen');
+    expect(companyRaw.messages).toHaveLength(1);
+    expect(companyRaw.messages[0].id).toBe('m-mention');
   });
 
   test('enrich can sync the brain via gbrain import and optional stale embeddings', async () => {
