@@ -45,12 +45,51 @@ One page per company or organization.
 - Individual people at a company → people/
 `;
 
+const TEST_TEMPLATE = `---
+aliases: []
+tags: []
+status: active
+created: YYYY-MM-DD
+---
+
+# Title
+
+## Compiled Truth
+
+### Summary
+- What this note is about in 2-5 bullets
+
+### Current State
+- What is true now
+- What has been decided
+- What is still uncertain
+
+### Open Threads
+- [ ] Thread 1
+- [ ] Thread 2
+
+### See Also
+- [[Related Note 1]]
+- [[Related Note 2]]
+
+---
+
+## Timeline
+
+### YYYY-MM-DD
+- Source:
+- What happened:
+- Why it matters:
+`;
+
 function writeResolver(brainDir: string) {
   mkdirSync(join(brainDir, 'people'), { recursive: true });
   mkdirSync(join(brainDir, 'companies'), { recursive: true });
+  mkdirSync(join(brainDir, '_templates'), { recursive: true });
   writeFileSync(join(brainDir, 'RESOLVER.md'), TEST_RESOLVER);
   writeFileSync(join(brainDir, 'people', 'README.md'), TEST_PEOPLE_README);
   writeFileSync(join(brainDir, 'companies', 'README.md'), TEST_COMPANIES_README);
+  writeFileSync(join(brainDir, '_templates', 'compiled-truth-timeline.md'), TEST_TEMPLATE);
 }
 
 describe('email collector scaffold', () => {
@@ -480,6 +519,40 @@ else:
     expect(stderr).toContain('Local resolver mismatch');
   });
 
+  test('enrich fails fast when compiled-truth template is missing', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`rm ${join(brainDir, '_templates', 'compiled-truth-timeline.md')}`;
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'missing-template',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Should fail',
+        snippet: 'No template',
+        body: 'No template present.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/missing-template',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/missing-template)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('compiled-truth-timeline.md not found');
+  });
+
   test('enrich creates a person page and raw sidecar from collected email messages', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
@@ -519,10 +592,16 @@ else:
 
     const person = readFileSync(personPath, 'utf-8');
     expect(person).toContain('aliases: ["Jane Doe", "jane@example.com"]');
-    expect(person).toContain('## State');
-    expect(person).toContain('Last touched via email on 2026-04-12');
-    expect(person).toContain('2026-04-12 | Email from Jane Doe <jane@example.com>: Design review tomorrow');
-    expect(person).toContain('[Source: Gmail, 2026-04-12T09:00:00Z]');
+    expect(person).toContain('status: active');
+    expect(person).toContain('created: 2026-04-12');
+    expect(person).toContain('# Jane Doe');
+    expect(person).toContain('## Compiled Truth');
+    expect(person).toContain('### Current State');
+    expect(person).toContain('Latest email subject: Design review tomorrow');
+    expect(person).toContain('## Timeline');
+    expect(person).toContain('### 2026-04-12');
+    expect(person).toContain('Source: Gmail — 2026-04-12T09:00:00Z | Message ID: m-1');
+    expect(person).toContain('What happened: Received email "Design review tomorrow" from Jane Doe <jane@example.com>.');
 
     const raw = JSON.parse(readFileSync(rawPath, 'utf-8'));
     expect(raw.messages).toHaveLength(1);
@@ -538,22 +617,35 @@ else:
     mkdirSync(rawDir, { recursive: true });
     writeFileSync(join(peopleDir, 'jane-doe.md'), `---
 aliases: ["Jane Doe", "jane@example.com"]
+tags: []
+status: active
+created: 2026-04-10
 ---
+
 # Jane Doe
 
-> Executive summary.
+## Compiled Truth
 
-## State
+### Summary
 - Existing note
 
-## Open Threads
-- None
+### Current State
+- Previously touched
 
-## See Also
+### Open Threads
+- [ ] Existing thread
+
+### See Also
 - None
 
 ---
-2026-04-10 | Existing timeline entry [Source: Manual, 2026-04-10]
+
+## Timeline
+
+### 2026-04-10
+- Source: Manual
+- What happened: Existing timeline entry
+- Why it matters: Preserved context
 `);
 
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
@@ -587,8 +679,11 @@ aliases: ["Jane Doe", "jane@example.com"]
     const person = readFileSync(join(peopleDir, 'jane-doe.md'), 'utf-8');
     expect(person).toContain('aliases: ["Jane Doe", "jane@example.com"]');
     expect(person).toContain('- Existing note');
-    expect(person).toContain('2026-04-10 | Existing timeline entry');
-    expect(person).toContain('2026-04-12 | Email from Jane Doe <jane@example.com>: Following up');
+    expect(person).toContain('- [ ] Existing thread');
+    expect(person).toContain('### 2026-04-10');
+    expect(person).toContain('What happened: Existing timeline entry');
+    expect(person).toContain('Source: Gmail — 2026-04-12T11:00:00Z | Message ID: m-2');
+    expect(person).toContain('What happened: Received email "Following up" from Jane Doe <jane@example.com>.');
   });
 
   test('enrich updates mentioned people and companies, not just the sender', async () => {
@@ -599,16 +694,35 @@ aliases: ["Jane Doe", "jane@example.com"]
     mkdirSync(companyDir, { recursive: true });
     writeFileSync(join(companyDir, 'acme-corp.md'), `---
 aliases: ["Acme Corp"]
+tags: []
+status: active
+created: 2026-04-10
 ---
+
 # Acme Corp
 
-> Existing company note.
+## Compiled Truth
 
-## State
+### Summary
+- Existing company note.
+
+### Current State
 - Existing company state
 
+### Open Threads
+- [ ] Existing company thread
+
+### See Also
+- None
+
 ---
-2026-04-10 | Existing company timeline [Source: Manual, 2026-04-10]
+
+## Timeline
+
+### 2026-04-10
+- Source: Manual
+- What happened: Existing company timeline
+- Why it matters: Preserved context
 `);
 
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
@@ -646,11 +760,21 @@ aliases: ["Acme Corp"]
     const companyPage = readFileSync(join(brainDir, 'companies', 'acme-corp.md'), 'utf-8');
     const companyRaw = JSON.parse(readFileSync(join(brainDir, 'companies', '.raw', 'acme-corp.json'), 'utf-8'));
 
-    expect(senderPage).toContain('Email from Jane Doe <jane@example.com>: Loop in Sarah Chen');
-    expect(mentionedPerson).toContain('Mentioned in email from Jane Doe <jane@example.com>: Sarah Chen — Loop in Sarah Chen');
-    expect(companyPage).toContain('> Existing company note.');
-    expect(companyPage).toContain('2026-04-10 | Existing company timeline');
-    expect(companyPage).toContain('Mentioned in email from Jane Doe <jane@example.com>: Acme Corp — Loop in Sarah Chen');
+    expect(senderPage).toContain('## Compiled Truth');
+    expect(senderPage).toContain('- [[Acme Corp]]');
+    expect(senderPage).toContain('- [[Sarah Chen]]');
+    expect(senderPage).toContain('What happened: Received email "Loop in Sarah Chen" from Jane Doe <jane@example.com>.');
+
+    expect(mentionedPerson).toContain('## Compiled Truth');
+    expect(mentionedPerson).toContain('- [[Acme Corp]]');
+    expect(mentionedPerson).toContain('- [[Jane Doe]]');
+    expect(mentionedPerson).toContain('What happened: Sarah Chen was mentioned in email "Loop in Sarah Chen" from Jane Doe <jane@example.com>.');
+
+    expect(companyPage).toContain('- Existing company note.');
+    expect(companyPage).toContain('What happened: Existing company timeline');
+    expect(companyPage).toContain('- [[Jane Doe]]');
+    expect(companyPage).toContain('- [[Sarah Chen]]');
+    expect(companyPage).toContain('What happened: Acme Corp was mentioned in email "Loop in Sarah Chen" from Jane Doe <jane@example.com>.');
     expect(companyRaw.messages).toHaveLength(1);
     expect(companyRaw.messages[0].id).toBe('m-mention');
   });
