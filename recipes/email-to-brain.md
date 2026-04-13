@@ -215,21 +215,31 @@ Use the scaffold bridge first, then let the agent do deeper judgment work.
 
 ```bash
 cd scripts/email-collector
-node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12
+node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12 --sync
+# optional: add --embed-stale if you want embeddings refreshed immediately too
 ```
 
 What the bridge does deterministically:
 1. resolves sender identity from the collected message
 2. finds or creates `people/<slug>.md`
-3. appends a sourced timeline entry for the email
+3. preserves existing compiled truth while appending a sourced timeline entry
 4. writes raw source data to `people/.raw/<slug>.json`
+5. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
+
+The collector also preserves richer Gmail metadata for downstream automation:
+- `thread_id`
+- `message_id_header`
+- `label_ids`
+- `history_id`
+- `internal_date`
+- `to`, `cc`, `reply_to`, `delivered_to`
 
 Then the agent does the higher-judgment pass:
 1. **Detect entities**: who sent it? Who is mentioned? What companies?
 2. **Check the brain**: `gbrain search "sender name"` — do we have a page?
 3. **Update compiled truth** if the new email materially changes the state of play
 4. **Extract action items**: if the email requires a response or action, log it
-5. **Sync**: run `gbrain sync --no-pull --no-embed` to index changes
+5. **Sync**: prefer `node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12 --sync`; add `--embed-stale` when you want embeddings refreshed too
 
 ### Step 5: Set Up Cron
 

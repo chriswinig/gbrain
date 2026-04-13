@@ -175,7 +175,7 @@ describe('email collector scaffold', () => {
     expect(digest).toContain('[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/a)');
   });
 
-  test('collect with provider gws pulls list/get via gws cli and writes normalized messages', async () => {
+  test('collect with provider gws paginates list calls and writes richer gmail metadata', async () => {
     const dir = makeTempDir();
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
 
@@ -183,23 +183,58 @@ describe('email collector scaffold', () => {
     writeFileSync(fakeGws, `#!/usr/bin/env python3
 import json, sys
 args = sys.argv[1:]
+params = {}
+if '--params' in args:
+    params = json.loads(args[args.index('--params') + 1])
 if args[:4] == ['gmail', 'users', 'messages', 'list']:
-    print(json.dumps({'messages': [{'id': 'gws-1'}]}))
+    if params.get('pageToken') == 'page-2':
+        print(json.dumps({'messages': [{'id': 'gws-2'}]}))
+    else:
+        print(json.dumps({'messages': [{'id': 'gws-1'}], 'nextPageToken': 'page-2'}))
 elif args[:4] == ['gmail', 'users', 'messages', 'get']:
-    print(json.dumps({
-        'id': 'gws-1',
-        'threadId': 'thread-1',
-        'snippet': 'Need your review',
-        'payload': {
-            'headers': [
-                {'name': 'From', 'value': 'person@example.com'},
-                {'name': 'Subject', 'value': 'Review this'},
-                {'name': 'Date', 'value': 'Sat, 12 Apr 2026 10:00:00 +0000'}
-            ],
-            'mimeType': 'text/plain',
-            'body': {'data': 'UGxlYXNlIHJldmlldyB0aGlzLg=='}
-        }
-    }))
+    if params.get('id') == 'gws-2':
+        print(json.dumps({
+            'id': 'gws-2',
+            'threadId': 'thread-2',
+            'historyId': 'hist-2',
+            'internalDate': '1775988600000',
+            'labelIds': ['UNREAD'],
+            'snippet': 'Second page message',
+            'payload': {
+                'headers': [
+                    {'name': 'From', 'value': 'second@example.com'},
+                    {'name': 'Subject', 'value': 'Page two'},
+                    {'name': 'Date', 'value': 'Sat, 12 Apr 2026 10:10:00 +0000'}
+                ],
+                'mimeType': 'text/plain',
+                'body': {'data': 'U2Vjb25kIHBhZ2UgbWVzc2FnZS4='}
+            }
+        }))
+    else:
+        print(json.dumps({
+            'id': 'gws-1',
+            'threadId': 'thread-1',
+            'historyId': 'hist-1',
+            'internalDate': '1775988000000',
+            'labelIds': ['UNREAD', 'INBOX'],
+            'snippet': 'Need your review',
+            'payload': {
+                'headers': [
+                    {'name': 'From', 'value': 'person@example.com'},
+                    {'name': 'To', 'value': 'me@gmail.com'},
+                    {'name': 'Cc', 'value': 'team@example.com'},
+                    {'name': 'Reply-To', 'value': 'reply@example.com'},
+                    {'name': 'Delivered-To', 'value': 'me@gmail.com'},
+                    {'name': 'Subject', 'value': 'Review this'},
+                    {'name': 'Date', 'value': 'Sat, 12 Apr 2026 10:00:00 +0000'},
+                    {'name': 'Message-ID', 'value': '<msg-1@example.com>'},
+                    {'name': 'In-Reply-To', 'value': '<older@example.com>'},
+                    {'name': 'References', 'value': '<older@example.com>'}
+                ],
+                'mimeType': 'text/plain',
+                'body': {'data': 'UGxlYXNlIHJldmlldyB0aGlzLg=='}
+            }
+        }))
 else:
     print(json.dumps({}))
 `);
@@ -217,13 +252,27 @@ else:
 
     const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
     const messages = JSON.parse(readFileSync(outPath, 'utf-8'));
-    expect(messages).toHaveLength(1);
+    expect(messages).toHaveLength(2);
     expect(messages[0].id).toBe('gws-1');
     expect(messages[0].from).toBe('person@example.com');
+    expect(messages[0].to).toBe('me@gmail.com');
+    expect(messages[0].cc).toBe('team@example.com');
+    expect(messages[0].reply_to).toBe('reply@example.com');
+    expect(messages[0].delivered_to).toBe('me@gmail.com');
     expect(messages[0].subject).toBe('Review this');
     expect(messages[0].snippet).toBe('Need your review');
     expect(messages[0].body).toContain('Please review this.');
+    expect(messages[0].thread_id).toBe('thread-1');
+    expect(messages[0].history_id).toBe('hist-1');
+    expect(messages[0].internal_date).toBe('1775988000000');
+    expect(messages[0].label_ids).toEqual(['UNREAD', 'INBOX']);
+    expect(messages[0].message_id_header).toBe('<msg-1@example.com>');
+    expect(messages[0].in_reply_to).toBe('<older@example.com>');
+    expect(messages[0].references).toBe('<older@example.com>');
+    expect(messages[0].date_iso).toBe('2026-04-12T10:00:00.000Z');
     expect(messages[0].gmail_link).toBe('https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/gws-1');
+    expect(messages[1].id).toBe('gws-2');
+    expect(messages[1].body).toContain('Second page message.');
   });
 
   test('enrich creates a person page and raw sidecar from collected email messages', async () => {
@@ -329,7 +378,59 @@ aliases: ["Jane Doe", "jane@example.com"]
     expect(stderr).toBe('');
 
     const person = readFileSync(join(peopleDir, 'jane-doe.md'), 'utf-8');
+    expect(person).toContain('aliases: ["Jane Doe", "jane@example.com"]');
+    expect(person).toContain('- Existing note');
     expect(person).toContain('2026-04-10 | Existing timeline entry');
     expect(person).toContain('2026-04-12 | Email from Jane Doe <jane@example.com>: Following up');
+  });
+
+  test('enrich can sync the brain via gbrain import and optional stale embeddings', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    const fakeGbrain = join(dir, 'fake-gbrain.py');
+    const gbrainLog = join(dir, 'gbrain-log.jsonl');
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'm-sync',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Sync this brain',
+        snippet: 'Kick import',
+        body: 'Please sync the brain after enrichment.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-sync',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/m-sync)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+    writeFileSync(fakeGbrain, `#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+log_path = Path(${JSON.stringify(gbrainLog)})
+with log_path.open('a') as f:
+    f.write(json.dumps({'args': sys.argv[1:]}) + '\\n')
+print('ok')
+`);
+    await Bun.$`chmod +x ${fakeGbrain}`;
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12', '--sync', '--gbrain-bin', fakeGbrain, '--embed-stale'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const stdout = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe('');
+    expect(stdout).toContain('synced brain + embedded stale chunks');
+
+    const calls = readFileSync(gbrainLog, 'utf-8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls).toHaveLength(2);
+    expect(calls[0].args).toEqual(['import', brainDir, '--no-embed']);
+    expect(calls[1].args).toEqual(['embed', '--stale']);
   });
 });
