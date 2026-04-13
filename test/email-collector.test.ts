@@ -10,6 +10,24 @@ function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), 'gbrain-email-collector-'));
 }
 
+const TEST_RESOLVER = `# Knowledge Resolver
+
+## Directory Decision Tree
+
+\`\`\`
+Is it about a specific human being?
+  → people/
+
+Is it about a company or organization (not a person)?
+  → companies/
+\`\`\`
+`;
+
+function writeResolver(brainDir: string) {
+  mkdirSync(brainDir, { recursive: true });
+  writeFileSync(join(brainDir, 'RESOLVER.md'), TEST_RESOLVER);
+}
+
 describe('email collector scaffold', () => {
   test('init creates expected directory structure and default state', async () => {
     const dir = makeTempDir();
@@ -178,6 +196,7 @@ describe('email collector scaffold', () => {
   test('digest and enrich default to the latest collected date when --date is omitted', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
     writeFileSync(join(dir, 'data', 'messages', '2026-04-11.json'), JSON.stringify([
       {
@@ -323,6 +342,7 @@ else:
   test('enrich routes obvious company senders into companies instead of people', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
     const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
     writeFileSync(outPath, JSON.stringify([
@@ -369,9 +389,42 @@ else:
     expect(existsSync(join(brainDir, 'people', 'figma.md'))).toBe(false);
   });
 
+  test('enrich fails fast when brain root is missing RESOLVER.md', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'missing-resolver',
+        from: 'Jane Doe <jane@example.com>',
+        subject: 'Should fail',
+        snippet: 'No resolver',
+        body: 'No resolver present.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/missing-resolver',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/missing-resolver)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain('RESOLVER.md not found');
+  });
+
   test('enrich creates a person page and raw sidecar from collected email messages', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
     const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
     writeFileSync(outPath, JSON.stringify([
@@ -420,6 +473,7 @@ else:
   test('enrich updates existing person page by alias email without overwriting earlier timeline', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
     const peopleDir = join(brainDir, 'people');
     const rawDir = join(peopleDir, '.raw');
     mkdirSync(rawDir, { recursive: true });
@@ -481,6 +535,7 @@ aliases: ["Jane Doe", "jane@example.com"]
   test('enrich updates mentioned people and companies, not just the sender', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
     const companyDir = join(brainDir, 'companies');
     mkdirSync(companyDir, { recursive: true });
     writeFileSync(join(companyDir, 'acme-corp.md'), `---
@@ -544,6 +599,7 @@ aliases: ["Acme Corp"]
   test('enrich can sync the brain via gbrain import and optional stale embeddings', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
     const fakeGbrain = join(dir, 'fake-gbrain.py');
     const gbrainLog = join(dir, 'gbrain-log.jsonl');
     await Bun.$`node ${scriptPath} init --dir ${dir}`;

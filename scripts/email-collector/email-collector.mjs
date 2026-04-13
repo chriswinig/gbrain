@@ -189,9 +189,9 @@ function buildGwsQuery(state) {
   if (!Number.isNaN(lastCollectAt)) {
     const overlapSeconds = 5 * 60;
     const afterSeconds = Math.max(0, Math.floor(lastCollectAt / 1000) - overlapSeconds);
-    return `is:unread after:${afterSeconds}`;
+    return `after:${afterSeconds}`;
   }
-  return 'is:unread newer_than:1d';
+  return 'newer_than:1d';
 }
 
 function listGwsMessages(gwsBin, query) {
@@ -330,7 +330,7 @@ function normalizeNameKey(text) {
   return String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
-function senderEntityDir(sender) {
+function classifySenderEntityKind(sender) {
   const displayName = normalizeEntityName(sender.displayName || '');
   const { local, domain, domainBase } = senderEmailParts(sender.email);
   const displayKey = normalizeNameKey(displayName);
@@ -341,15 +341,15 @@ function senderEntityDir(sender) {
   const domainMatchesDisplay = Boolean(displayKey && domainKey && domainKey === displayKey);
   const localMatchesDisplay = Boolean(displayKey && localKey && localKey === displayKey);
 
-  if (looksLikePersonName(displayName)) return 'people';
+  if (looksLikePersonName(displayName)) return 'person';
   if (displayName.includes(' ')) {
-    if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'companies';
-    return 'people';
+    if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'company';
+    return 'person';
   }
-  if (isPersonalDomain && localMatchesDisplay) return 'people';
-  if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'companies';
-  if (localMatchesDisplay && !hasGenericLocal) return isPersonalDomain ? 'people' : 'people';
-  return sender.email ? 'companies' : 'people';
+  if (isPersonalDomain && localMatchesDisplay) return 'person';
+  if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'company';
+  if (localMatchesDisplay && !hasGenericLocal) return 'person';
+  return sender.email ? 'company' : 'person';
 }
 
 function slugify(text) {
@@ -447,10 +447,59 @@ function findEntityPage(entityDir, candidates) {
   return null;
 }
 
+function readResolver(brainDir) {
+  const resolverPath = join(resolve(brainDir), 'RESOLVER.md');
+  if (!existsSync(resolverPath)) {
+    throw new Error(`RESOLVER.md not found in brain root: ${resolve(brainDir)}`);
+  }
+  return readFileSync(resolverPath, 'utf8');
+}
+
+function parseResolverRules(content) {
+  const blockMatch = String(content || '').match(/## Directory Decision Tree[\s\S]*?```([\s\S]*?)```/i);
+  const source = blockMatch ? blockMatch[1] : String(content || '');
+  const lines = source.split('\n');
+  const rules = [];
+  for (let i = 0; i < lines.length; i++) {
+    const question = lines[i].trim();
+    if (!question || !question.endsWith('?')) continue;
+    const next = lines[i + 1] ? lines[i + 1].trim() : '';
+    const targetMatch = next.match(/^→\s*([^\s]+)/);
+    if (!targetMatch) continue;
+    rules.push({
+      question,
+      target: targetMatch[1].replace(/\/+$/g, ''),
+    });
+  }
+  return rules;
+}
+
+function resolverRuleMatches(question, entityKind) {
+  const lower = String(question || '').toLowerCase();
+  if (entityKind === 'person') {
+    return lower.includes('specific human') || lower.includes('human being') || lower.includes('human') || lower.includes('person');
+  }
+  if (entityKind === 'company') {
+    return lower.includes('company') || lower.includes('organization');
+  }
+  return false;
+}
+
+function resolveEntityDir(brainDir, entityKind) {
+  const rules = parseResolverRules(readResolver(brainDir));
+  for (const rule of rules) {
+    if (resolverRuleMatches(rule.question, entityKind)) {
+      return rule.target;
+    }
+  }
+  throw new Error(`RESOLVER.md in ${resolve(brainDir)} does not define a target for entity kind: ${entityKind}`);
+}
+
 function loadEntityCatalog(brainDir) {
   const root = resolve(brainDir);
   return ['people', 'companies'].flatMap(dirName => listEntityPages(join(root, dirName)).map(page => ({
     dir: dirName,
+    kind: dirName === 'people' ? 'person' : 'company',
     slug: page.slug,
     title: page.title,
     aliases: page.aliases,
@@ -467,6 +516,7 @@ function detectMentionedEntities(message, brainDir, sender) {
     if (entity.aliases.some(alias => senderNames.has(alias.toLowerCase()))) continue;
     if (entity.aliases.some(alias => containsEntityMention(text, alias))) {
       matches.set(`${entity.dir}:${entity.slug}`, {
+        kind: entity.kind,
         dir: entity.dir,
         name: entity.title || entity.aliases[0] || entity.slug,
         aliases: entity.aliases,
@@ -478,21 +528,21 @@ function detectMentionedEntities(message, brainDir, sender) {
   for (const match of text.matchAll(companyPattern)) {
     const candidate = normalizeEntityName(match[1]);
     if (!candidate || isStopwordEntity(candidate)) continue;
-    matches.set(`companies:${slugify(candidate)}`, { dir: 'companies', name: candidate, aliases: [candidate] });
+    matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate] });
   }
 
   const personCuePattern = /\b(?:with|to|cc|include|loop in|introduce|met|meet|spoke with|talked to)\s+([A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+){1,2})\b/g;
   for (const match of text.matchAll(personCuePattern)) {
     const candidate = normalizeEntityName(match[1]);
     if (!looksLikePersonName(candidate) || senderNames.has(candidate.toLowerCase())) continue;
-    matches.set(`people:${slugify(candidate)}`, { dir: 'people', name: candidate, aliases: [candidate] });
+    matches.set(`people:${slugify(candidate)}`, { kind: 'person', dir: 'people', name: candidate, aliases: [candidate] });
   }
 
   const companyCuePattern = /\b(?:at|via|from)\s+([A-Z][A-Za-z0-9&.-]*)\b/g;
   for (const match of text.matchAll(companyCuePattern)) {
     const candidate = normalizeEntityName(match[1]);
     if (!candidate || isStopwordEntity(candidate) || senderNames.has(candidate.toLowerCase()) || !looksLikeCompanyName(candidate)) continue;
-    matches.set(`companies:${slugify(candidate)}`, { dir: 'companies', name: candidate, aliases: [candidate] });
+    matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate] });
   }
 
   return Array.from(matches.values());
@@ -627,19 +677,23 @@ function syncBrain(brainDir, gbrainBin, embedStale) {
 
 function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedStale) {
   if (!brainDir) throw new Error('--brain-dir is required for enrich');
+  // Hard requirement: enrich is resolver-driven, not hardcoded routing.
+  readResolver(brainDir);
+
   const date = normalizeDate(dateArg || latestCollectedDate(baseDir));
   const records = readJson(messagesPath(baseDir, date), []);
 
   let updated = 0;
   for (const message of records.filter(msg => !msg.is_noise)) {
     const sender = parseSender(message.from);
-    const senderDir = senderEntityDir(sender);
+    const senderDir = resolveEntityDir(brainDir, classifySenderEntityKind(sender));
     upsertEntityPage(brainDir, senderDir, sender.displayName, [sender.displayName, sender.email].filter(Boolean), date, message, 'sender');
     updated += 1;
 
     const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
     for (const entity of mentions) {
-      upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases || [entity.name], date, message, 'mention');
+      const resolvedDir = resolveEntityDir(brainDir, entity.kind || (entity.dir === 'people' ? 'person' : 'company'));
+      upsertEntityPage(brainDir, resolvedDir, entity.name, entity.aliases || [entity.name], date, message, 'mention');
       updated += 1;
     }
   }
