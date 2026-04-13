@@ -221,10 +221,11 @@ node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-0
 
 What the bridge does deterministically:
 1. resolves sender identity from the collected message
-2. finds or creates `people/<slug>.md`
-3. preserves existing compiled truth while appending a sourced timeline entry
-4. writes raw source data to `people/.raw/<slug>.json`
-5. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
+2. finds or creates the sender page in `people/<slug>.md`
+3. touches mentioned people and companies too when the email includes clear entity cues or matches existing brain pages
+4. preserves existing compiled truth while appending sourced timeline entries
+5. writes raw source data to `.raw/` sidecars under `people/` and `companies/`
+6. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
 
 The collector also preserves richer Gmail metadata for downstream automation:
 - `thread_id`
