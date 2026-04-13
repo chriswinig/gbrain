@@ -320,6 +320,55 @@ else:
     expect(messages[1].body).toContain('Second page message.');
   });
 
+  test('enrich routes obvious company senders into companies instead of people', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const outPath = join(dir, 'data', 'messages', '2026-04-12.json');
+    writeFileSync(outPath, JSON.stringify([
+      {
+        id: 'company-1',
+        from: 'X <invoice+statements+acct_123@stripe.com>',
+        subject: 'Your receipt from X',
+        snippet: 'Receipt attached',
+        body: 'Your receipt from X for April.',
+        date: '2026-04-12T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/company-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/company-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      },
+      {
+        id: 'company-2',
+        from: 'Figma <no-reply@figma.com>',
+        subject: 'Explore dev mode in Figma',
+        snippet: 'Try the latest feature',
+        body: 'Explore dev mode in Figma today.',
+        date: '2026-04-12T10:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/company-2',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/company-2)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stderr = await new Response(proc.stderr).text();
+    const exitCode = await proc.exited;
+    expect(exitCode).toBe(0);
+    expect(stderr).toBe('');
+    expect(existsSync(join(brainDir, 'companies', 'x.md'))).toBe(true);
+    expect(existsSync(join(brainDir, 'companies', 'figma.md'))).toBe(true);
+    expect(existsSync(join(brainDir, 'people', 'x.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'people', 'figma.md'))).toBe(false);
+  });
+
   test('enrich creates a person page and raw sidecar from collected email messages', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
