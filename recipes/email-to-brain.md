@@ -222,11 +222,11 @@ node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-0
 
 What the bridge does deterministically:
 1. treats `--brain-dir` as the brain root governed by `RESOLVER.md`
-2. resolves sender identity from the collected message
-3. writes the sender page directly into `people/<slug>.md`
+2. reads `RESOLVER.md`, walks the top-level decision tree, and files senders/entities accordingly
+3. resolves sender identity from the collected message
 4. touches mentioned people and companies too when the email includes clear entity cues or matches existing brain pages
 5. preserves existing compiled truth while appending sourced timeline entries
-6. writes raw source data to `.raw/` sidecars under `people/` and `companies/`
+6. writes raw source data to `.raw/` sidecars under the resolved entity directories
 7. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
 
 The collector also preserves richer Gmail metadata for downstream automation:
