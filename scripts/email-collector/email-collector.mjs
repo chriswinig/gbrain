@@ -618,7 +618,7 @@ USAGE
   node email-collector.mjs collect --dir <path> --input <file.json> --account <email> [--date YYYY-MM-DD]
   node email-collector.mjs collect --dir <path> --provider gws --gws-bin /opt/homebrew/bin/gws --account <email> [--date YYYY-MM-DD]
   node email-collector.mjs digest --dir <path> [--date YYYY-MM-DD]
-  node email-collector.mjs enrich --dir <collector-path> --brain-dir <brain-path> [--date YYYY-MM-DD] [--sync] [--gbrain-bin /path/to/gbrain] [--embed-stale]
+  node email-collector.mjs enrich --dir <collector-path> --brain-dir <brain-root-with-RESOLVER.md> [--date YYYY-MM-DD] [--sync] [--gbrain-bin /path/to/gbrain] [--embed-stale]
 `);
 }
 

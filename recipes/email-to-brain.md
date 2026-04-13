@@ -215,17 +215,19 @@ Use the scaffold bridge first, then let the agent do deeper judgment work.
 
 ```bash
 cd scripts/email-collector
+# --brain-dir should point at the brain root containing RESOLVER.md
 node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12 --sync
 # optional: add --embed-stale if you want embeddings refreshed immediately too
 ```
 
 What the bridge does deterministically:
-1. resolves sender identity from the collected message
-2. finds or creates the sender page in `people/<slug>.md`
-3. touches mentioned people and companies too when the email includes clear entity cues or matches existing brain pages
-4. preserves existing compiled truth while appending sourced timeline entries
-5. writes raw source data to `.raw/` sidecars under `people/` and `companies/`
-6. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
+1. treats `--brain-dir` as the brain root governed by `RESOLVER.md`
+2. resolves sender identity from the collected message
+3. writes the sender page directly into `people/<slug>.md`
+4. touches mentioned people and companies too when the email includes clear entity cues or matches existing brain pages
+5. preserves existing compiled truth while appending sourced timeline entries
+6. writes raw source data to `.raw/` sidecars under `people/` and `companies/`
+7. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
 
 The collector also preserves richer Gmail metadata for downstream automation:
 - `thread_id`
