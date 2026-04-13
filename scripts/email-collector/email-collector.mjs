@@ -455,6 +455,20 @@ function readResolver(brainDir) {
   return readFileSync(resolverPath, 'utf8');
 }
 
+function readCompiledTruthTemplate(brainDir) {
+  const templatePath = join(resolve(brainDir), '_templates', 'compiled-truth-timeline.md');
+  if (!existsSync(templatePath)) {
+    throw new Error(`compiled-truth-timeline.md not found under ${resolve(brainDir)}/_templates`);
+  }
+  const content = readFileSync(templatePath, 'utf8');
+  for (const required of ['## Compiled Truth', '### Summary', '### Current State', '### Open Threads', '### See Also', '## Timeline']) {
+    if (!content.includes(required)) {
+      throw new Error(`compiled-truth-timeline.md missing required section: ${required}`);
+    }
+  }
+  return content;
+}
+
 function parseResolverRules(content) {
   const blockMatch = String(content || '').match(/## Directory Decision Tree[\s\S]*?```([\s\S]*?)```/i);
   const source = blockMatch ? blockMatch[1] : String(content || '');
@@ -580,80 +594,163 @@ function detectMentionedEntities(message, brainDir, sender) {
   return Array.from(matches.values());
 }
 
+function parseFrontmatter(content) {
+  const text = String(content || '');
+  if (!text.startsWith('---\n')) {
+    return { frontmatter: {}, body: text.trim() };
+  }
+  const end = text.indexOf('\n---\n', 4);
+  if (end === -1) {
+    return { frontmatter: {}, body: text.trim() };
+  }
+  const raw = text.slice(4, end).trim();
+  const body = text.slice(end + 5).trim();
+  const frontmatter = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || !trimmed.includes(':')) continue;
+    const idx = trimmed.indexOf(':');
+    const key = trimmed.slice(0, idx).trim();
+    const value = trimmed.slice(idx + 1).trim();
+    if ((key === 'aliases' || key === 'tags') && value.startsWith('[') && value.endsWith(']')) {
+      frontmatter[key] = value.slice(1, -1).split(',').map(part => part.trim()).filter(Boolean).map(part => part.replace(/^"|"$/g, ''));
+    } else {
+      frontmatter[key] = value.replace(/^"|"$/g, '');
+    }
+  }
+  return { frontmatter, body };
+}
+
 function splitPage(content) {
-  const marker = '\n---\n';
-  const idx = content.indexOf(marker);
-  if (idx === -1) return { compiled: content.trim(), timeline: '' };
-  return {
-    compiled: content.slice(0, idx).trim(),
-    timeline: content.slice(idx + marker.length).trim(),
-  };
+  const parsed = parseFrontmatter(content);
+  const body = parsed.body || '';
+  const timelineMatch = body.match(/([\s\S]*?)\n---\n\s*(## Timeline[\s\S]*)$/);
+  if (timelineMatch) {
+    return {
+      frontmatter: parsed.frontmatter,
+      compiled: timelineMatch[1].trim(),
+      timeline: timelineMatch[2].trim(),
+    };
+  }
+  const idx = body.indexOf('\n## Timeline');
+  if (idx !== -1) {
+    return {
+      frontmatter: parsed.frontmatter,
+      compiled: body.slice(0, idx).trim(),
+      timeline: body.slice(idx + 1).trim(),
+    };
+  }
+  return { frontmatter: parsed.frontmatter, compiled: body.trim(), timeline: '' };
 }
 
 function findPersonPage(peopleDir, sender) {
   return findEntityPage(peopleDir, [sender.email, sender.displayName].filter(Boolean));
 }
 
-function buildCompiledContent(sender, aliases, date) {
-  return `---\naliases: [${aliases.map(alias => `"${alias}"`).join(', ')}]\n---\n# ${sender.displayName}\n\n> Executive summary.\n\n## State\n- Last touched via email on ${date}\n\n## Open Threads\n- None\n\n## See Also\n- None`;
+function yamlArray(values) {
+  return `[${values.map(value => `"${value}"`).join(', ')}]`;
 }
 
-function upsertAliasesFrontmatter(compiled, aliases) {
-  const aliasLine = `aliases: [${aliases.map(alias => `"${alias}"`).join(', ')}]`;
-  if (compiled.startsWith('---\n')) {
-    const end = compiled.indexOf('\n---\n', 4);
-    if (end !== -1) {
-      let frontmatter = compiled.slice(4, end).trimEnd();
-      if (/^aliases:\s*\[.*\]$/m.test(frontmatter)) {
-        frontmatter = frontmatter.replace(/^aliases:\s*\[.*\]$/m, aliasLine);
-      } else {
-        frontmatter = `${frontmatter}\n${aliasLine}`.trim();
-      }
-      const rest = compiled.slice(end + 5).trimStart();
-      return `---\n${frontmatter}\n---\n${rest}`.trim();
-    }
+function serializeFrontmatter(frontmatter) {
+  const lines = [];
+  if (Array.isArray(frontmatter.aliases)) lines.push(`aliases: ${yamlArray(frontmatter.aliases)}`);
+  if (Array.isArray(frontmatter.tags)) lines.push(`tags: ${yamlArray(frontmatter.tags)}`);
+  if (frontmatter.status) lines.push(`status: ${frontmatter.status}`);
+  if (frontmatter.created) lines.push(`created: ${frontmatter.created}`);
+  return `---\n${lines.join('\n')}\n---`;
+}
+
+function extractSubsection(compiled, heading) {
+  const pattern = new RegExp(`### ${escapeRegex(heading)}\\n([\\s\\S]*?)(?=\\n### |\\n## |$)`);
+  const match = String(compiled || '').match(pattern);
+  return match ? match[1].trim() : '';
+}
+
+function normalizeBulletBlock(text, fallback) {
+  const value = String(text || '').trim();
+  return value || fallback;
+}
+
+function parseSeeAlsoEntries(compiled) {
+  const section = extractSubsection(compiled, 'See Also');
+  const names = [];
+  for (const line of section.split('\n')) {
+    const trimmed = line.trim();
+    const wiki = trimmed.match(/\[\[(.*?)\]\]/);
+    if (wiki) names.push(normalizeEntityName(wiki[1]));
   }
-  return `---\n${aliasLine}\n---\n${compiled.trim()}`.trim();
+  return names.filter(Boolean);
 }
 
-function upsertLastTouched(compiled, date) {
-  const touchedLine = `- Last touched via email on ${date}`;
-  if (/^- Last touched via email on .*$/m.test(compiled)) {
-    return compiled.replace(/^- Last touched via email on .*$/m, touchedLine);
-  }
-  if (/## State\s*\n/m.test(compiled)) {
-    return compiled.replace(/## State\s*\n/m, `## State\n${touchedLine}\n`);
-  }
-  return `${compiled.trim()}\n\n## State\n${touchedLine}`.trim();
+function buildSeeAlsoBlock(existingCompiled, relatedNames) {
+  const names = Array.from(new Set(parseSeeAlsoEntries(existingCompiled).concat(relatedNames.map(normalizeEntityName)).filter(Boolean))).sort((a, b) => a.localeCompare(b));
+  if (names.length === 0) return '- None';
+  return names.map(name => `- [[${name}]]`).join('\n');
 }
 
-function mergeCompiledContent(existingCompiled, sender, aliases, date) {
-  let compiled = existingCompiled && existingCompiled.trim()
-    ? existingCompiled.trim()
-    : buildCompiledContent(sender, aliases, date);
-
-  compiled = upsertAliasesFrontmatter(compiled, aliases);
-  compiled = upsertLastTouched(compiled, date);
-  return compiled.trim();
+function buildTemplateCompiledContent(title, existingCompiled, relatedNames, date, message) {
+  const summary = normalizeBulletBlock(
+    extractSubsection(existingCompiled, 'Summary'),
+    `- Auto-created from email collector.\n- Tracks email-derived context for ${title}.`
+  );
+  const openThreads = normalizeBulletBlock(
+    extractSubsection(existingCompiled, 'Open Threads'),
+    '- [ ] Review latest email context if action is needed'
+  );
+  const currentState = [
+    `- Last touched via email on ${date}`,
+    `- Latest email subject: ${message.subject || '(no subject)'}`,
+    `- Latest sender: ${message.from || 'Unknown sender'}`,
+  ].join('\n');
+  const seeAlso = buildSeeAlsoBlock(existingCompiled, relatedNames);
+  return `# ${title}\n\n## Compiled Truth\n\n### Summary\n${summary}\n\n### Current State\n${currentState}\n\n### Open Threads\n${openThreads}\n\n### See Also\n${seeAlso}`.trim();
 }
 
-function appendUniqueTimelineEntry(existingTimeline, entry) {
-  if (!existingTimeline) return entry;
-  if (existingTimeline.includes(entry)) return existingTimeline;
-  return `${existingTimeline.trim()}\n${entry}`;
+function ensureTimelineSection(existingTimeline) {
+  const timeline = String(existingTimeline || '').trim();
+  return timeline || '## Timeline';
 }
 
-function appendTimelineEntry(existingTimeline, message) {
-  const entry = `${normalizeDate(message.date)} | Email from ${message.from}: ${message.subject} [Source: Gmail, ${message.date}]`;
-  return appendUniqueTimelineEntry(existingTimeline, entry);
+function appendStructuredTimelineEntry(existingTimeline, date, messageId, sourceLine, whatHappened, whyItMatters) {
+  const timeline = ensureTimelineSection(existingTimeline);
+  const marker = `Message ID: ${messageId}`;
+  if (timeline.includes(marker)) return timeline;
+  const entry = `### ${date}\n- Source: ${sourceLine} | Message ID: ${messageId}\n- What happened: ${whatHappened}\n- Why it matters: ${whyItMatters}`;
+  return `${timeline.trim()}\n\n${entry}`.trim();
 }
 
-function appendMentionTimelineEntry(existingTimeline, message, entityName) {
-  const entry = `${normalizeDate(message.date)} | Mentioned in email from ${message.from}: ${entityName} — ${message.subject} [Source: Gmail, ${message.date}]`;
-  return appendUniqueTimelineEntry(existingTimeline, entry);
+function appendTimelineEntry(existingTimeline, entityName, message) {
+  return appendStructuredTimelineEntry(
+    existingTimeline,
+    normalizeDate(message.date),
+    message.id,
+    `Gmail — ${message.date}`,
+    `Received email "${message.subject || '(no subject)'}" from ${message.from}.`,
+    `Updates the current state for ${entityName}.`
+  );
 }
 
-function upsertEntityPage(brainDir, dirName, entityName, aliases, date, message, mode) {
+function appendMentionTimelineEntry(existingTimeline, entityName, message) {
+  return appendStructuredTimelineEntry(
+    existingTimeline,
+    normalizeDate(message.date),
+    `${message.id}:${slugify(entityName)}`,
+    `Gmail — ${message.date}`,
+    `${entityName} was mentioned in email "${message.subject || '(no subject)'}" from ${message.from}.`,
+    `Keeps ${entityName} linked to the surrounding email context.`
+  );
+}
+
+function buildManagedFrontmatter(existingFrontmatter, aliases, date) {
+  return {
+    aliases,
+    tags: Array.isArray(existingFrontmatter.tags) ? existingFrontmatter.tags : [],
+    status: existingFrontmatter.status || 'active',
+    created: existingFrontmatter.created || date,
+  };
+}
+
+function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, date, message, mode) {
   const entityDir = join(resolve(brainDir), dirName);
   const rawDir = join(entityDir, '.raw');
   ensureDir(entityDir);
@@ -671,18 +768,19 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, date, message,
     .concat(existing ? parseAliases(existing.content) : [])
     .filter(Boolean)
     .map(normalizeEntityName)));
-  const compiled = mergeCompiledContent(page.compiled, { displayName: entityName }, mergedAliases, date);
+  const compiled = buildTemplateCompiledContent(entityName, page.compiled, relatedNames, date, message);
   const timeline = mode === 'sender'
-    ? appendTimelineEntry(page.timeline, message)
-    : appendMentionTimelineEntry(page.timeline, message, entityName);
-  atomicWrite(entityPath, `${compiled}\n\n---\n${timeline}\n`);
+    ? appendTimelineEntry(page.timeline, entityName, message)
+    : appendMentionTimelineEntry(page.timeline, entityName, message);
+  const frontmatter = buildManagedFrontmatter(page.frontmatter || {}, mergedAliases, date);
+  atomicWrite(entityPath, `${serializeFrontmatter(frontmatter)}\n\n${compiled}\n\n---\n\n${timeline}\n`);
 
   const raw = readJson(rawPath, { messages: [] });
   if (!raw.messages.some(entry => entry.id === message.id)) {
     raw.messages.push(message);
   }
   atomicWrite(rawPath, JSON.stringify(raw, null, 2));
-  return { slug, path: entityPath };
+  return { slug, path: entityPath, title: entityName, dir: dirName };
 }
 
 function runCommand(bin, args, cwd) {
@@ -709,8 +807,9 @@ function syncBrain(brainDir, gbrainBin, embedStale) {
 
 function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedStale) {
   if (!brainDir) throw new Error('--brain-dir is required for enrich');
-  // Hard requirement: enrich is resolver-driven, not hardcoded routing.
+  // Hard requirement: enrich is contract-driven, not hardcoded routing.
   readResolver(brainDir);
+  readCompiledTruthTemplate(brainDir);
 
   const date = normalizeDate(dateArg || latestCollectedDate(baseDir));
   const records = readJson(messagesPath(baseDir, date), []);
@@ -721,15 +820,33 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
     const senderKind = classifySenderEntityKind(sender);
     const senderDir = resolveEntityDir(brainDir, senderKind);
     validateEntityAgainstLocalResolver(brainDir, senderDir, senderKind);
-    upsertEntityPage(brainDir, senderDir, sender.displayName, [sender.displayName, sender.email].filter(Boolean), date, message, 'sender');
-    updated += 1;
 
     const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
-    for (const entity of mentions) {
-      const entityKind = entity.kind || (entity.dir === 'people' ? 'person' : 'company');
-      const resolvedDir = resolveEntityDir(brainDir, entityKind);
-      validateEntityAgainstLocalResolver(brainDir, resolvedDir, entityKind);
-      upsertEntityPage(brainDir, resolvedDir, entity.name, entity.aliases || [entity.name], date, message, 'mention');
+    const entitiesForMessage = [
+      {
+        name: sender.displayName,
+        aliases: [sender.displayName, sender.email].filter(Boolean),
+        dir: senderDir,
+        mode: 'sender',
+      },
+      ...mentions.map(entity => {
+        const entityKind = entity.kind || (entity.dir === 'people' ? 'person' : 'company');
+        const resolvedDir = resolveEntityDir(brainDir, entityKind);
+        validateEntityAgainstLocalResolver(brainDir, resolvedDir, entityKind);
+        return {
+          name: entity.name,
+          aliases: entity.aliases || [entity.name],
+          dir: resolvedDir,
+          mode: 'mention',
+        };
+      }),
+    ];
+
+    for (const entity of entitiesForMessage) {
+      const relatedNames = entitiesForMessage
+        .filter(other => normalizeEntityName(other.name).toLowerCase() !== normalizeEntityName(entity.name).toLowerCase())
+        .map(other => other.name);
+      upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases, relatedNames, date, message, entity.mode);
       updated += 1;
     }
   }
