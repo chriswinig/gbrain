@@ -779,7 +779,7 @@ created: 2026-04-10
     expect(companyRaw.messages[0].id).toBe('m-mention');
   });
 
-  test('enrich can sync the brain via gbrain import and optional stale embeddings', async () => {
+  test('enrich can sync touched pages via gbrain put without re-importing the whole brain', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
     writeResolver(brainDir);
@@ -825,9 +825,9 @@ print('ok')
     expect(stdout).toContain('synced brain + embedded stale chunks');
 
     const calls = readFileSync(gbrainLog, 'utf-8').trim().split('\n').map(line => JSON.parse(line));
-    expect(calls).toHaveLength(2);
-    expect(calls[0].args).toEqual(['import', brainDir, '--no-embed']);
-    expect(calls[1].args).toEqual(['embed', '--stale']);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args[0]).toBe('put');
+    expect(calls[0].args[1]).toBe('people/jane-doe');
   });
 
   // === Task 7: Regression tests for known failure shapes ===
