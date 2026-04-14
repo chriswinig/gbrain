@@ -138,7 +138,8 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/enrichment-service.test.ts` (entity slugification, extraction, tier escalation),
 `test/data-research.test.ts` (recipe validation, MRR/ARR extraction, dedup, tracker parsing, HTML stripping),
 `test/extract.test.ts` (link extraction, timeline extraction, frontmatter parsing, directory type inference),
-`test/features.test.ts` (feature scanning, brain_score calculation, CLI routing, persistence).
+`test/features.test.ts` (feature scanning, brain_score calculation, CLI routing, persistence),
+`test/search-noise.test.ts` (pre-RRF page collapse, slug-prefix weight penalties).
 
 E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.
 - `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys)
