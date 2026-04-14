@@ -201,6 +201,7 @@ Same content.
         timeline: parsed.timeline,
         frontmatter: parsed.frontmatter,
         tags: parsed.tags.sort(),
+        outbound_links: [],
       }))
       .digest('hex');
 
@@ -241,6 +242,84 @@ Content here.
     expect(removeCalls.length).toBe(1);
     expect(removeCalls[0].args[1]).toBe('old-tag');
     expect(addCalls.length).toBe(2);
+  });
+
+  test('reconciles outbound links from Obsidian wikilinks', async () => {
+    const filePath = join(TMP, 'wikilinks.md');
+    writeFileSync(filePath, `---
+type: concept
+title: Wikilink Source
+---
+
+Met [[Jane Doe]] and [[Acme Corp|Acme]] during the trip.
+`);
+
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      getTags: () => Promise.resolve([]),
+      getLinks: () => Promise.resolve([]),
+      listPages: () => Promise.resolve([
+        {
+          slug: 'people/jane-doe',
+          title: 'Jane Doe',
+          frontmatter: { aliases: ['Janie Doe'] },
+        },
+        {
+          slug: 'companies/acme-corp',
+          title: 'Acme Corp',
+          frontmatter: {},
+        },
+      ]),
+    });
+
+    await importFile(engine, filePath, 'concepts/wikilinks.md', { noEmbed: true });
+
+    const calls = (engine as any)._calls;
+    const addLinkCalls = calls.filter((c: any) => c.method === 'addLink');
+
+    expect(addLinkCalls).toHaveLength(2);
+    expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
+      ['concepts/wikilinks', 'people/jane-doe'],
+      ['concepts/wikilinks', 'companies/acme-corp'],
+    ]));
+  });
+
+  test('reconciles wikilinks using pages beyond the first listPages() page', async () => {
+    const filePath = join(TMP, 'wikilinks-paginated.md');
+    writeFileSync(filePath, `---
+type: concept
+title: Paginated Wikilink Source
+---
+
+Met [[Angelica Hernandez]] during the trip.
+`);
+
+    const firstPage = Array.from({ length: 100 }, (_, i) => ({
+      slug: `concepts/filler-${i + 1}`,
+      title: `Filler ${i + 1}`,
+      frontmatter: {},
+    }));
+
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      getTags: () => Promise.resolve([]),
+      getLinks: () => Promise.resolve([]),
+      listPages: ({ offset = 0, limit = 100 } = {}) => {
+        const all = [
+          ...firstPage,
+          { slug: 'people/angelica-hernandez', title: 'Angelica Hernandez', frontmatter: {} },
+        ];
+        return Promise.resolve(all.slice(offset, offset + limit));
+      },
+    });
+
+    await importFile(engine, filePath, 'concepts/wikilinks-paginated.md', { noEmbed: true });
+
+    const calls = (engine as any)._calls;
+    const addLinkCalls = calls.filter((c: any) => c.method === 'addLink');
+    expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
+      ['concepts/wikilinks-paginated', 'people/angelica-hernandez'],
+    ]));
   });
 
   test('chunks compiled_truth and timeline separately', async () => {

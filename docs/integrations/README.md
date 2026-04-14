@@ -36,6 +36,7 @@ agent should follow.
 | [email-to-brain](../../recipes/email-to-brain.md) | Sense | credential-gateway | Gmail messages flow into entity pages via deterministic collector | 20 min |
 | [x-to-brain](../../recipes/x-to-brain.md) | Sense | — | Twitter timeline, mentions, keyword monitoring with deletion detection | 15 min |
 | [calendar-to-brain](../../recipes/calendar-to-brain.md) | Sense | credential-gateway | Google Calendar events become searchable daily brain pages | 20 min |
+| [telegram-transcript-to-brain](../../recipes/telegram-transcript-to-brain.md) | Sense | — | Hermes Telegram session transcripts become compiled-truth/timeline pages with dedupe state | 20 min |
 | [meeting-sync](../../recipes/meeting-sync.md) | Sense | — | Circleback meeting transcripts auto-import with attendee propagation | 15 min |
 
 ### Manual Integration Guides

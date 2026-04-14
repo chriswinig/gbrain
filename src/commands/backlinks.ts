@@ -10,9 +10,10 @@
  *   gbrain check-backlinks fix --dry-run                  # preview fixes
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, lstatSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, lstatSync, existsSync } from 'fs';
 import { join, relative, basename } from 'path';
-import { extractEntityRefs as canonicalExtractEntityRefs } from '../core/link-extraction.ts';
+import { buildPageResolver, resolvedEntityRefs, type ResolvedLinkTarget } from '../core/link-extraction.ts';
+import { parseMarkdown } from '../core/markdown.ts';
 
 interface BacklinkGap {
   /** The page that mentions the entity */
@@ -25,25 +26,34 @@ interface BacklinkGap {
   sourceTitle: string;
 }
 
-/**
- * Extract entity references from markdown content for the filesystem-based
- * back-link walker. Filters to people/companies only (this command historically
- * targets just those two dirs). Slug is returned WITHOUT the dir prefix to
- * preserve the legacy shape used by findBacklinkGaps and fixBacklinkGaps below.
- *
- * The canonical extractor (link-extraction.ts) returns dir-prefixed slugs
- * (e.g. "people/alice"); this wrapper strips the prefix back off so existing
- * filesystem-walker code that does `${dir}/${slug}` keeps working.
- */
-export function extractEntityRefs(content: string, _pagePath: string): { name: string; slug: string; dir: string }[] {
-  const refs = canonicalExtractEntityRefs(content);
-  return refs
-    .filter(r => r.dir === 'people' || r.dir === 'companies')
-    .map(r => ({
-      name: r.name,
-      slug: r.slug.startsWith(`${r.dir}/`) ? r.slug.slice(r.dir.length + 1) : r.slug,
-      dir: r.dir,
-    }));
+/** Extract entity references from markdown links and Obsidian wikilinks. */
+export function extractEntityRefs(
+  content: string,
+  pagePath: string,
+  resolver?: Map<string, ResolvedLinkTarget>,
+): { name: string; slug: string; dir: string }[] {
+  const refs: { name: string; slug: string; dir: string }[] = [];
+
+  // Match markdown links to brain pages: [Name](../people/slug.md) or [Name](../../companies/slug.md)
+  const linkPattern = /\[([^\]]+)\]\(([^)]*(?:people|companies)\/([^)]+\.md))\)/g;
+  let match;
+  while ((match = linkPattern.exec(content)) !== null) {
+    const name = match[1];
+    const fullPath = match[2];
+    const slug = match[3].replace('.md', '');
+    const dir = fullPath.includes('people') ? 'people' : 'companies';
+    refs.push({ name, slug, dir });
+  }
+
+  if (!resolver) return refs;
+
+  for (const ref of resolvedEntityRefs(content, pagePath.replace(/\.md$/i, ''), resolver)) {
+    if (!refs.some(existing => existing.dir === ref.dir && existing.slug === ref.slug)) {
+      refs.push(ref);
+    }
+  }
+
+  return refs;
 }
 
 /** Extract title from page (first H1 or frontmatter title) */
@@ -87,16 +97,22 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
   }
   walk(brainDir);
 
-  // Build a lookup of existing pages by directory/slug
+  // Build lookups of existing pages by slug/title/alias
   const pagesBySlug = new Map<string, { path: string; content: string }>();
-  for (const page of allPages) {
+  const resolver = buildPageResolver(allPages.map(page => {
+    const parsed = parseMarkdown(page.content, page.relPath);
     const slug = page.relPath.replace('.md', '');
     pagesBySlug.set(slug, { path: page.path, content: page.content });
-  }
+    return {
+      slug,
+      title: parsed.title,
+      frontmatter: parsed.frontmatter,
+    };
+  }));
 
   // For each page, check entity references
   for (const page of allPages) {
-    const refs = extractEntityRefs(page.content, page.relPath);
+    const refs = extractEntityRefs(page.content, page.relPath, resolver);
     const sourceFilename = basename(page.relPath);
 
     for (const ref of refs) {

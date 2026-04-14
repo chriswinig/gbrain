@@ -66,6 +66,8 @@ export interface SearchResult {
   chunk_index: number;
   score: number;
   stale: boolean;
+  graph_depth?: number;
+  graph_source_slugs?: string[];
 }
 
 export interface SearchOpts {

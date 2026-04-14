@@ -36,6 +36,21 @@ describe('extractEntityRefs', () => {
     expect(extractEntityRefs(content, 'test.md')).toHaveLength(0);
   });
 
+  test('extracts Obsidian wikilinks when a title resolver is provided', () => {
+    const resolver = new Map([
+      ['jane doe', { name: 'Jane Doe', slug: 'jane-doe', dir: 'people' }],
+      ['acme corp', { name: 'Acme Corp', slug: 'acme-corp', dir: 'companies' }],
+    ]);
+    const content = 'Met [[Jane Doe]] and [[Acme Corp|Acme]] during the trip.';
+    const refs = extractEntityRefs(content, 'meetings/test.md', resolver as any);
+
+    expect(refs).toHaveLength(2);
+    expect(refs).toEqual(expect.arrayContaining([
+      { name: 'Jane Doe', slug: 'jane-doe', dir: 'people' },
+      { name: 'Acme Corp', slug: 'acme-corp', dir: 'companies' },
+    ]));
+  });
+
   test('ignores non-entity brain links', () => {
     const content = '[Guide](../docs/setup.md) for reference.';
     expect(extractEntityRefs(content, 'test.md')).toHaveLength(0);

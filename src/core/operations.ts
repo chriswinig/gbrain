@@ -10,7 +10,7 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
-import { hybridSearch } from './search/hybrid.ts';
+import { hybridSearch, applyGraphExpansion } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { extractPageLinks, isAutoLinkEnabled } from './link-extraction.ts';
@@ -382,13 +382,18 @@ const search: Operation = {
     query: { type: 'string', required: true },
     limit: { type: 'number', description: 'Max results (default 20)' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
+    graph_depth: { type: 'number', description: 'Optionally follow outgoing/backlinks from result pages (max 2 hops)' },
   },
   handler: async (ctx, p) => {
-    const results = await ctx.engine.searchKeyword(p.query as string, {
+    const baseResults = await ctx.engine.searchKeyword(p.query as string, {
       limit: (p.limit as number) || 20,
       offset: (p.offset as number) || 0,
     });
-    return dedupResults(results);
+    return applyGraphExpansion(ctx.engine, baseResults, {
+      graphDepth: p.graph_depth as number | undefined,
+      limit: (p.limit as number) || 20,
+      offset: (p.offset as number) || 0,
+    });
   },
   cliHints: { name: 'search', positional: ['query'] },
 };
@@ -402,6 +407,7 @@ const query: Operation = {
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     expand: { type: 'boolean', description: 'Enable multi-query expansion (default: true)' },
     detail: { type: 'string', description: 'Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)' },
+    graph_depth: { type: 'number', description: 'Optionally follow outgoing/backlinks from result pages (max 2 hops)' },
   },
   handler: async (ctx, p) => {
     const expand = p.expand !== false;
@@ -412,6 +418,7 @@ const query: Operation = {
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
       detail,
+      graphDepth: p.graph_depth as number | undefined,
     });
   },
   cliHints: { name: 'query', positional: ['query'] },

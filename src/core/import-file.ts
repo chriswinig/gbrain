@@ -4,6 +4,7 @@ import type { BrainEngine } from './engine.ts';
 import { parseMarkdown } from './markdown.ts';
 import { chunkText } from './chunkers/recursive.ts';
 import { embedBatch } from './embedding.ts';
+import { buildPageResolver, extractResolvedLinks } from './link-extraction.ts';
 import { slugifyPath } from './sync.ts';
 import type { ChunkInput, PageType } from './types.ts';
 
@@ -36,6 +37,22 @@ export interface ImportResult {
 }
 
 const MAX_FILE_SIZE = 5_000_000; // 5MB
+const PAGE_RESOLVER_BATCH_SIZE = 500;
+
+async function listAllPages(engine: BrainEngine) {
+  const pages = [];
+  let offset = 0;
+
+  while (true) {
+    const batch = await engine.listPages({ limit: PAGE_RESOLVER_BATCH_SIZE, offset });
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    pages.push(...batch);
+    if (batch.length < PAGE_RESOLVER_BATCH_SIZE) break;
+    offset += batch.length;
+  }
+
+  return pages;
+}
 
 /**
  * Import content from a string. Core pipeline:
@@ -69,6 +86,13 @@ export async function importFromContent(
   }
 
   const parsed = parseMarkdown(content, slug + '.md');
+  const existingPages = await listAllPages(engine);
+  const resolver = buildPageResolver(existingPages as any[]);
+  const outboundLinks = extractResolvedLinks(
+    [parsed.compiled_truth, parsed.timeline].filter(Boolean).join('\n\n'),
+    slug,
+    resolver,
+  );
 
   // Hash includes ALL fields for idempotency (not just compiled_truth + timeline)
   const hash = createHash('sha256')
@@ -79,6 +103,7 @@ export async function importFromContent(
       timeline: parsed.timeline,
       frontmatter: parsed.frontmatter,
       tags: parsed.tags.sort(),
+      outbound_links: outboundLinks,
     }))
     .digest('hex');
 
@@ -143,6 +168,17 @@ export async function importFromContent(
     }
     for (const tag of parsed.tags) {
       await tx.addTag(slug, tag);
+    }
+
+    const currentLinks = await tx.getLinks(slug);
+    const existingLinks = Array.isArray(currentLinks) ? currentLinks : [];
+    const existingTargets = new Set(existingLinks.map(link => link.to_slug).filter(Boolean));
+    const nextTargets = new Set(outboundLinks);
+    for (const target of existingTargets) {
+      if (!nextTargets.has(target)) await tx.removeLink(slug, target);
+    }
+    for (const target of nextTargets) {
+      if (!existingTargets.has(target)) await tx.addLink(slug, target, '', 'mention');
     }
 
     if (chunks.length > 0) {
