@@ -598,6 +598,8 @@ else:
     expect(person).toContain('## Compiled Truth');
     expect(person).toContain('### Current State');
     expect(person).toContain('Latest email subject: Design review tomorrow');
+    expect(person).toContain('### Open Threads');
+    expect(person).toContain('- [ ] Please review the deck before tomorrow (due 2026-04-13)');
     expect(person).toContain('## Timeline');
     expect(person).toContain('### 2026-04-12');
     expect(person).toContain('Source: Gmail — 2026-04-12T09:00:00Z | Message ID: m-1');
@@ -606,6 +608,7 @@ else:
     const raw = JSON.parse(readFileSync(rawPath, 'utf-8'));
     expect(raw.messages).toHaveLength(1);
     expect(raw.messages[0].id).toBe('m-1');
+    expect(raw.messages[0].action_items).toContain('- [ ] Please review the deck before tomorrow (due 2026-04-13)');
   });
 
   test('enrich updates existing person page by alias email without overwriting earlier timeline', async () => {
@@ -1362,5 +1365,144 @@ created: 2026-04-01
     const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
     expect(unresolved).toHaveLength(1);
     expect(unresolved[0].message_id).toBe('ambig-x-dedupe');
+  });
+
+  test('enrich merges sender into existing opposite-type page instead of creating cross-type duplicate', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(join(companiesDir, '.raw'), { recursive: true });
+    writeFileSync(join(companiesDir, 'the-woolshire.md'), `---
+aliases: ["The Woolshire", "orders@thewoolshire.com"]
+tags: []
+status: active
+created: 2026-04-01
+---
+
+# The Woolshire
+
+## Compiled Truth
+
+### Summary
+- Existing company note
+
+### Current State
+- Active
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'woolshire-1',
+      from: 'The Woolshire <hello@thewoolshire.com>',
+      subject: 'Order update',
+      snippet: 'Your order update',
+      body: 'The Woolshire order update.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/woolshire-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/woolshire-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    expect(existsSync(join(brainDir, 'companies', 'the-woolshire.md'))).toBe(true);
+    expect(existsSync(join(brainDir, 'people', 'the-woolshire.md'))).toBe(false);
+    const page = readFileSync(join(companiesDir, 'the-woolshire.md'), 'utf-8');
+    expect(page).toContain('Order update');
+  });
+
+  test('enrich writes unresolved record when both people and companies have equally strong cross-type matches', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(peopleDir, { recursive: true });
+    mkdirSync(companiesDir, { recursive: true });
+    writeFileSync(join(peopleDir, 'the-woolshire.md'), `---
+aliases: ["The Woolshire", "hello@thewoolshire.com"]
+status: active
+created: 2026-04-01
+---
+
+# The Woolshire
+
+## Compiled Truth
+
+### Summary
+- Person version
+
+### Current State
+- Active
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    writeFileSync(join(companiesDir, 'the-woolshire.md'), `---
+aliases: ["The Woolshire", "hello@thewoolshire.com"]
+status: active
+created: 2026-04-01
+---
+
+# The Woolshire
+
+## Compiled Truth
+
+### Summary
+- Company version
+
+### Current State
+- Active
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'woolshire-ambig',
+      from: 'The Woolshire <hello@thewoolshire.com>',
+      subject: 'Order update',
+      snippet: 'Your order update',
+      body: 'The Woolshire order update.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/woolshire-ambig',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/woolshire-ambig)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
+    expect(unresolved.some((r: any) => r.message_id === 'woolshire-ambig' && /Cross-type sender match is ambiguous/.test(r.reason))).toBe(true);
   });
 });
