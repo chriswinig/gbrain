@@ -18,8 +18,14 @@ const SIGNATURE_PATTERNS = [
 ];
 const COMPANY_SUFFIXES = new Set(['inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'co', 'labs', 'lab', 'ai', 'ventures', 'capital', 'group', 'studio', 'studios', 'systems', 'technologies', 'technology', 'partners', 'health', 'fitness']);
 const ENTITY_STOPWORDS = new Set(['Need', 'Review', 'Please', 'Thanks', 'Thank', 'Tomorrow', 'Today', 'Team', 'Brain', 'Email', 'Sync', 'This', 'That', 'Message', 'Messages', 'Page', 'Pages', 'Open', 'Threads', 'Executive', 'Summary', 'Last', 'Touched', 'Design', 'Kick', 'Import', 'Real']);
-const GENERIC_SENDER_LOCAL_PARTS = [/noreply/i, /no-reply/i, /notification/i, /support/i, /billing/i, /invoice/i, /statement/i, /receipt/i, /team/i, /info/i, /contact/i, /mail/i, /system/i, /security/i, /account/i, /acct_/i, /hello/i, /jobs/i, /careers/i];
+const GENERIC_SENDER_LOCAL_PARTS = [/noreply/i, /no-reply/i, /notification/i, /support/i, /billing/i, /invoice/i, /statement/i, /receipt/i, /team/i, /info/i, /contact/i, /mail/i, /system/i, /security/i, /account/i, /acct_/i, /hello/i, /jobs/i, /careers/i, /feedback/i];
 const PERSONAL_EMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'icloud.com', 'me.com', 'mac.com', 'yahoo.com', 'proton.me', 'protonmail.com', 'pm.me', 'aol.com']);
+const NOISE_ENTITY_BLOCKLIST = new Set(['notification', 'support', 'us', 'noreply', 'info', 'alerts', 'admin', 'team', 'hello', 'contact', 'help', 'sales', 'billing', 'feedback', 'system', 'security', 'account', 'service', 'mail', 'update', 'updates', 'news', 'newsletter', 'marketing', 'promotions', 'no-reply', 'do-not-reply', 'donotreply']);
+const WEAK_ALIAS_BLOCKLIST = new Set(['x', 'us', 'support', 'notification', 'billing', 'feedback', 'info', 'team', 'admin', 'help', 'sales', 'contact', 'service', 'mail', 'system', 'security', 'account', 'hello', 'news', 'update', 'alerts', 'hr', 'it', 'ops', 'dev', 'qa', 'api', 'app', 'web', 'go', 'do', 'ai', 'io', 'me', 'my', 'to', 'at', 'up', 'no', 'on', 'or', 'so', 'ok']);
+const MATCH_THRESHOLD = 0.3;
+const SENDER_MERGE_THRESHOLD = 0.3;
+const MENTION_MERGE_THRESHOLD = 0.5;
+const MENTION_CREATE_THRESHOLD = 0.6;
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -304,17 +310,39 @@ function digest(baseDir, dateArg) {
   return { date, total: records.length };
 }
 
+function stripWrappingQuotes(text) {
+  const value = String(text || '').trim();
+  if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+    return value.slice(1, -1).trim();
+  }
+  return value;
+}
+
+function sanitizeSenderDisplayName(raw) {
+  let name = String(raw || '').trim();
+  name = stripWrappingQuotes(name);
+  // Handle pipe-delimited names like "2020 | Cyncly" → "Cyncly"
+  if (name.includes('|')) {
+    const parts = name.split('|').map(p => p.trim()).filter(Boolean);
+    const best = parts.find(p => !/^\d{4}$/.test(p) && p.length > 1) || parts[parts.length - 1];
+    name = best;
+  }
+  // Strip leading/trailing punctuation
+  name = name.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+  return name.trim() || 'Unknown Sender';
+}
+
 function parseSender(fromHeader) {
   const match = String(fromHeader || '').match(/^(.*?)\s*<([^>]+)>$/);
   if (match) {
-    return { displayName: match[1].trim(), email: match[2].trim().toLowerCase() };
+    return { displayName: sanitizeSenderDisplayName(match[1]), email: match[2].trim().toLowerCase() };
   }
   const value = String(fromHeader || '').trim();
   if (value.includes('@')) {
     const name = value.split('@')[0].replace(/[._-]+/g, ' ').trim();
     return { displayName: name.split(/\s+/).map(part => part ? part[0].toUpperCase() + part.slice(1) : '').join(' '), email: value.toLowerCase() };
   }
-  return { displayName: value || 'Unknown Sender', email: '' };
+  return { displayName: sanitizeSenderDisplayName(value), email: '' };
 }
 
 function senderEmailParts(email) {
@@ -340,14 +368,13 @@ function classifySenderEntityKind(sender) {
   const hasGenericLocal = GENERIC_SENDER_LOCAL_PARTS.some(pattern => pattern.test(local));
   const domainMatchesDisplay = Boolean(displayKey && domainKey && domainKey === displayKey);
   const localMatchesDisplay = Boolean(displayKey && localKey && localKey === displayKey);
+  const companySignals = hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName);
 
+  if (isPersonalDomain && looksLikePersonName(displayName)) return 'person';
+  if (companySignals) return 'company';
   if (looksLikePersonName(displayName)) return 'person';
-  if (displayName.includes(' ')) {
-    if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'company';
-    return 'person';
-  }
+  if (displayName.includes(' ')) return 'person';
   if (isPersonalDomain && localMatchesDisplay) return 'person';
-  if (hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName)) return 'company';
   if (localMatchesDisplay && !hasGenericLocal) return 'person';
   return sender.email ? 'company' : 'person';
 }
@@ -359,23 +386,74 @@ function slugify(text) {
     .replace(/^-+|-+$/g, '') || 'unknown-sender';
 }
 
+function parseInlineArray(body) {
+  const values = [];
+  let i = 0;
+  while (i < body.length) {
+    while (i < body.length && /[\s,]/.test(body[i])) i += 1;
+    if (i >= body.length) break;
+
+    const quote = body[i] === '"' || body[i] === "'" ? body[i] : null;
+    let value = '';
+
+    if (quote && body[i + 1] === quote) {
+      i += 2;
+      const end = body.indexOf(`${quote}${quote}`, i);
+      if (end === -1) {
+        value = body.slice(i);
+        i = body.length;
+      } else {
+        value = body.slice(i, end);
+        i = end + 2;
+      }
+    } else if (quote) {
+      i += 1;
+      while (i < body.length) {
+        const char = body[i];
+        if (char === '\\' && i + 1 < body.length) {
+          value += body[i + 1];
+          i += 2;
+          continue;
+        }
+        if (char === quote) {
+          i += 1;
+          break;
+        }
+        value += char;
+        i += 1;
+      }
+    } else {
+      const nextComma = body.indexOf(',', i);
+      if (nextComma === -1) {
+        value = body.slice(i);
+        i = body.length;
+      } else {
+        value = body.slice(i, nextComma);
+        i = nextComma;
+      }
+    }
+
+    const normalized = stripWrappingQuotes(value).replace(/\\([\\"])/g, '$1').trim();
+    if (normalized) values.push(normalized);
+    while (i < body.length && /\s/.test(body[i])) i += 1;
+    if (body[i] === ',') i += 1;
+  }
+  return values;
+}
+
 function parseAliases(content) {
   const match = content.match(/aliases:\s*\[(.*?)\]/s);
   if (!match) return [];
-  return match[1]
-    .split(',')
-    .map(part => part.trim())
-    .filter(Boolean)
-    .map(part => part.replace(/^"|"$/g, ''));
+  return parseInlineArray(match[1]);
 }
 
 function extractTitle(content) {
   const match = String(content || '').match(/^#\s+(.+)$/m);
-  return match ? match[1].trim() : '';
+  return match ? stripWrappingQuotes(match[1]) : '';
 }
 
 function normalizeEntityName(text) {
-  const tokens = String(text || '').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+  const tokens = stripWrappingQuotes(String(text || '')).replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
   const collapsed = [];
   for (const token of tokens) {
     if (collapsed.length === 0 || collapsed[collapsed.length - 1].toLowerCase() !== token.toLowerCase()) {
@@ -407,7 +485,7 @@ function looksLikePersonName(name) {
   const tokens = normalized.split(' ');
   if (tokens.length < 2 || tokens.length > 3) return false;
   if (isStopwordEntity(normalized) || looksLikeCompanyName(normalized)) return false;
-  return tokens.every(token => /^[A-Z][a-z'’-]+$/.test(token));
+  return tokens.every(token => /^[A-Z][a-z''-]+$/.test(token));
 }
 
 function containsEntityMention(text, alias) {
@@ -445,6 +523,133 @@ function findEntityPage(entityDir, candidates) {
     }
   }
   return null;
+}
+
+function significantTokens(text) {
+  return String(text || '').toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(t => t.length > 1 && !COMPANY_SUFFIXES.has(t) && !WEAK_ALIAS_BLOCKLIST.has(t));
+}
+
+function isWeakAlias(alias) {
+  const normalized = String(alias || '').trim().toLowerCase();
+  if (!normalized) return true;
+  if (WEAK_ALIAS_BLOCKLIST.has(normalized)) return true;
+  if (normalized.length <= 1) return true;
+  if (NOISE_ENTITY_BLOCKLIST.has(normalized)) return true;
+  return false;
+}
+
+function isViableSenderEntity(name) {
+  const normalized = normalizeEntityName(name);
+  if (!normalized) return false;
+  if (NOISE_ENTITY_BLOCKLIST.has(normalized.toLowerCase())) return false;
+  if (normalized.length <= 1 && !/[A-Z]/.test(normalized)) return false;
+  return true;
+}
+
+function scoreEntityMatch(candidateName, candidateAliases, page) {
+  const candidateNorm = normalizeEntityName(candidateName).toLowerCase();
+  const pageTitle = normalizeEntityName(page.title).toLowerCase();
+
+  // Exact title match
+  if (candidateNorm && pageTitle && candidateNorm === pageTitle) return 1.0;
+
+  // Exact alias match
+  const pageAliasesLower = page.aliases.map(a => normalizeEntityName(a).toLowerCase());
+  if (candidateNorm && pageAliasesLower.includes(candidateNorm)) {
+    if (isWeakAlias(candidateNorm)) return 0.1; // weak alias match — too risky to trust
+    return 0.8;
+  }
+
+  // Email alias match — check if any candidate alias (email) matches a page alias exactly
+  for (const ca of candidateAliases || []) {
+    const caNorm = String(ca || '').trim().toLowerCase();
+    if (caNorm && caNorm.includes('@') && pageAliasesLower.includes(caNorm)) return 0.95;
+  }
+
+  // Slug match
+  const candidateSlug = slugify(candidateName);
+  if (candidateSlug && candidateSlug === page.slug) return 0.9;
+
+  // Normalized key match
+  const candidateKey = normalizeNameKey(candidateName);
+  const pageKey = normalizeNameKey(page.title);
+  if (candidateKey && pageKey && candidateKey === pageKey) return 0.85;
+
+  // Token overlap (Jaccard similarity)
+  const candidateTokens = significantTokens(candidateName);
+  const pageTokens = significantTokens(page.title);
+  if (candidateTokens.length === 0 || pageTokens.length === 0) return 0;
+
+  const candidateSet = new Set(candidateTokens);
+  const pageSet = new Set(pageTokens);
+  let intersection = 0;
+  for (const t of candidateSet) {
+    if (pageSet.has(t)) intersection++;
+  }
+  const union = new Set([...candidateTokens, ...pageTokens]).size;
+  if (union === 0) return 0;
+  return (intersection / union) * 0.8;
+}
+
+function findBestEntityPage(entityDir, candidates, candidateAliases) {
+  const pages = listEntityPages(entityDir);
+  let bestPage = null;
+  let bestScore = 0;
+
+  for (const page of pages) {
+    for (const candidate of candidates.filter(Boolean)) {
+      const score = scoreEntityMatch(candidate, candidateAliases, page);
+      if (score > bestScore) {
+        bestScore = score;
+        bestPage = page;
+      }
+    }
+  }
+
+  return bestScore >= MATCH_THRESHOLD ? bestPage : null;
+}
+
+function isPlausibleAliasMatch(newName, existingTitle) {
+  const newTokens = new Set(significantTokens(newName));
+  const existingTokens = new Set(significantTokens(existingTitle));
+
+  // If either side has zero tokens, reject the merge
+  if (newTokens.size === 0 && existingTokens.size > 0) return false;
+  if (existingTokens.size === 0 && newTokens.size > 0) return false;
+  if (newTokens.size === 0 && existingTokens.size === 0) return false;
+
+  for (const token of newTokens) {
+    if (existingTokens.has(token)) return true;
+  }
+  return false;
+}
+
+function sanitizeAliases(aliases) {
+  return aliases.filter(alias => !isWeakAlias(alias));
+}
+
+function writeUnresolvedCandidate(baseDir, record) {
+  const date = record.date || new Date().toISOString().slice(0, 10);
+  const reportDir = join(resolve(baseDir), 'data', 'reports', 'unresolved-entities');
+  ensureDir(reportDir);
+  const reportPath = join(reportDir, `${date}.json`);
+  const existing = readJson(reportPath, []);
+  const key = JSON.stringify([
+    record.message_id || '',
+    record.candidate_name || '',
+    record.source || '',
+    record.reason || '',
+  ]);
+  const deduped = existing.filter(entry => JSON.stringify([
+    entry.message_id || '',
+    entry.candidate_name || '',
+    entry.source || '',
+    entry.reason || '',
+  ]) !== key);
+  deduped.push(record);
+  atomicWrite(reportPath, JSON.stringify(deduped, null, 2));
 }
 
 function readResolver(brainDir) {
@@ -553,7 +758,9 @@ function loadEntityCatalog(brainDir) {
 }
 
 function detectMentionedEntities(message, brainDir, sender) {
-  const text = [message.subject, message.snippet, message.body].filter(Boolean).join('\n');
+  // Limit catalog matching to same scope as new-entity extraction (subject + first 500 chars)
+  // to prevent self-reinforcing junk entities from matching in footers/boilerplate
+  const text = [message.subject, (message.snippet || '').slice(0, 500)].filter(Boolean).join('\n');
   const catalog = loadEntityCatalog(brainDir);
   const matches = new Map();
   const senderNames = new Set([sender.displayName, sender.email].filter(Boolean).map(value => normalizeEntityName(value).toLowerCase()));
@@ -570,25 +777,36 @@ function detectMentionedEntities(message, brainDir, sender) {
     }
   }
 
+  // Only create new entities from regex when evidence is strong (Task 3: existing-first, create-last)
   const companyPattern = /\b([A-Z][A-Za-z0-9&.-]*(?:\s+[A-Z][A-Za-z0-9&.-]*){0,3}\s(?:Inc|LLC|Ltd|Corp|Corporation|Company|Co|Labs|Lab|AI|Ventures|Capital|Group|Studio|Studios|Systems|Technologies|Technology|Partners|Health|Fitness))\b/g;
   for (const match of text.matchAll(companyPattern)) {
     const candidate = normalizeEntityName(match[1]);
     if (!candidate || isStopwordEntity(candidate)) continue;
-    matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate] });
+    if (NOISE_ENTITY_BLOCKLIST.has(candidate.toLowerCase())) continue;
+    matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate], source: 'mention' });
   }
 
-  const personCuePattern = /\b(?:with|to|cc|include|loop in|introduce|met|meet|spoke with|talked to)\s+([A-Z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+){1,2})\b/g;
+  const personCuePattern = /\b(?:with|to|cc|include|loop in|introduce|met|meet|spoke with|talked to)\s+([A-Z][a-z''-]+(?:\s+[A-Z][a-z''-]+){1,2})\b/g;
   for (const match of text.matchAll(personCuePattern)) {
     const candidate = normalizeEntityName(match[1]);
     if (!looksLikePersonName(candidate) || senderNames.has(candidate.toLowerCase())) continue;
-    matches.set(`people:${slugify(candidate)}`, { kind: 'person', dir: 'people', name: candidate, aliases: [candidate] });
+    if (NOISE_ENTITY_BLOCKLIST.has(candidate.toLowerCase())) continue;
+    matches.set(`people:${slugify(candidate)}`, { kind: 'person', dir: 'people', name: candidate, aliases: [candidate], source: 'mention' });
   }
 
+  // companyCuePattern disabled for single-word generic mentions (Task 3)
+  // Only allow if the candidate has explicit company suffix or strong brand-casing
   const companyCuePattern = /\b(?:at|via|from)\s+([A-Z][A-Za-z0-9&.-]*)\b/g;
   for (const match of text.matchAll(companyCuePattern)) {
     const candidate = normalizeEntityName(match[1]);
-    if (!candidate || isStopwordEntity(candidate) || senderNames.has(candidate.toLowerCase()) || !looksLikeCompanyName(candidate)) continue;
-    matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate] });
+    if (!candidate || isStopwordEntity(candidate) || senderNames.has(candidate.toLowerCase())) continue;
+    if (NOISE_ENTITY_BLOCKLIST.has(candidate.toLowerCase())) continue;
+    // Require explicit company suffix for companyCuePattern — single-word brand-casing alone is too risky
+    if (!looksLikeCompanyName(candidate)) continue;
+    const tokens = candidate.split(' ');
+    const lastToken = tokens[tokens.length - 1].toLowerCase();
+    if (tokens.length === 1 && !COMPANY_SUFFIXES.has(lastToken)) continue; // single-word without suffix: skip
+    matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate], source: 'mention' });
   }
 
   return Array.from(matches.values());
@@ -613,9 +831,9 @@ function parseFrontmatter(content) {
     const key = trimmed.slice(0, idx).trim();
     const value = trimmed.slice(idx + 1).trim();
     if ((key === 'aliases' || key === 'tags') && value.startsWith('[') && value.endsWith(']')) {
-      frontmatter[key] = value.slice(1, -1).split(',').map(part => part.trim()).filter(Boolean).map(part => part.replace(/^"|"$/g, ''));
+      frontmatter[key] = parseInlineArray(value.slice(1, -1));
     } else {
-      frontmatter[key] = value.replace(/^"|"$/g, '');
+      frontmatter[key] = stripWrappingQuotes(value);
     }
   }
   return { frontmatter, body };
@@ -647,8 +865,15 @@ function findPersonPage(peopleDir, sender) {
   return findEntityPage(peopleDir, [sender.email, sender.displayName].filter(Boolean));
 }
 
+function yamlScalar(value) {
+  const escaped = String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
 function yamlArray(values) {
-  return `[${values.map(value => `"${value}"`).join(', ')}]`;
+  return `[${values.map(value => yamlScalar(value)).join(', ')}]`;
 }
 
 function serializeFrontmatter(frontmatter) {
@@ -669,6 +894,19 @@ function extractSubsection(compiled, heading) {
 function normalizeBulletBlock(text, fallback) {
   const value = String(text || '').trim();
   return value || fallback;
+}
+
+function mergeBulletBlocks(existingText, generatedLines) {
+  const existingLines = String(existingText || '').split('\n').map(line => line.trim()).filter(Boolean);
+  const generated = generatedLines.map(line => String(line || '').trim()).filter(Boolean);
+  const seen = new Set();
+  const merged = [];
+  for (const line of existingLines.concat(generated)) {
+    if (seen.has(line)) continue;
+    seen.add(line);
+    merged.push(line);
+  }
+  return merged.join('\n');
 }
 
 function parseSeeAlsoEntries(compiled) {
@@ -697,11 +935,14 @@ function buildTemplateCompiledContent(title, existingCompiled, relatedNames, dat
     extractSubsection(existingCompiled, 'Open Threads'),
     '- [ ] Review latest email context if action is needed'
   );
-  const currentState = [
-    `- Last touched via email on ${date}`,
-    `- Latest email subject: ${message.subject || '(no subject)'}`,
-    `- Latest sender: ${message.from || 'Unknown sender'}`,
-  ].join('\n');
+  const currentState = mergeBulletBlocks(
+    extractSubsection(existingCompiled, 'Current State'),
+    [
+      `- Last touched via email on ${date}`,
+      `- Latest email subject: ${message.subject || '(no subject)'}`,
+      `- Latest sender: ${message.from || 'Unknown sender'}`,
+    ]
+  );
   const seeAlso = buildSeeAlsoBlock(existingCompiled, relatedNames);
   return `# ${title}\n\n## Compiled Truth\n\n### Summary\n${summary}\n\n### Current State\n${currentState}\n\n### Open Threads\n${openThreads}\n\n### See Also\n${seeAlso}`.trim();
 }
@@ -750,29 +991,130 @@ function buildManagedFrontmatter(existingFrontmatter, aliases, date) {
   };
 }
 
-function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, date, message, mode) {
+function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, date, message, mode, collectorBaseDir) {
   const entityDir = join(resolve(brainDir), dirName);
   const rawDir = join(entityDir, '.raw');
   ensureDir(entityDir);
   ensureDir(rawDir);
 
-  const existing = findEntityPage(entityDir, [entityName].concat(aliases).filter(Boolean));
-  const slug = existing?.slug || slugify(entityName);
+  if (collectorBaseDir && mode === 'sender' && isWeakAlias(entityName)) {
+    writeUnresolvedCandidate(collectorBaseDir, {
+      message_id: message.id,
+      date,
+      kind: 'sender',
+      candidate_name: entityName,
+      candidate_aliases: aliases,
+      source: mode,
+      reason: 'Weak sender alias requires manual review',
+      top_matches: [],
+    });
+  }
+
+  // Task 1+6: Use scored matching instead of first-match-wins
+  const allCandidates = [entityName, ...aliases].filter(Boolean);
+  const mergeThreshold = mode === 'sender' ? SENDER_MERGE_THRESHOLD : MENTION_MERGE_THRESHOLD;
+  const existing = findBestEntityPage(entityDir, allCandidates, aliases);
+
+  // Task 6: Score-based merge guard with secondary token overlap check
+  if (existing) {
+    // Compute best score for this match
+    let bestScore = 0;
+    for (const candidate of allCandidates) {
+      const s = scoreEntityMatch(candidate, aliases, existing);
+      if (s > bestScore) bestScore = s;
+    }
+
+    if (bestScore < mergeThreshold) {
+      // Below merge threshold — write unresolved record instead of merging (Task 4)
+      if (collectorBaseDir) {
+        writeUnresolvedCandidate(collectorBaseDir, {
+          message_id: message.id,
+          date,
+          kind: mode === 'sender' ? classifySenderEntityKind({ displayName: entityName, email: aliases.find(a => a.includes('@')) || '' }) : 'unknown',
+          candidate_name: entityName,
+          candidate_aliases: aliases,
+          source: mode,
+          reason: `Score ${bestScore.toFixed(2)} below ${mode} merge threshold ${mergeThreshold}`,
+          top_matches: [{ slug: existing.slug, title: existing.title, score: bestScore }],
+        });
+      }
+      // Fall through to create separate page
+    } else if (bestScore < 0.8 && !isPlausibleAliasMatch(entityName, existing.title)) {
+      // Secondary guard: token overlap check to prevent contamination
+      if (collectorBaseDir) {
+        writeUnresolvedCandidate(collectorBaseDir, {
+          message_id: message.id,
+          date,
+          kind: mode === 'sender' ? 'sender' : 'mention',
+          candidate_name: entityName,
+          candidate_aliases: aliases,
+          source: mode,
+          reason: `Token overlap guard rejected merge with "${existing.title}" despite score ${bestScore.toFixed(2)}`,
+          top_matches: [{ slug: existing.slug, title: existing.title, score: bestScore }],
+        });
+      }
+      // Fall through to create separate page
+    } else {
+      // Merge into existing page
+      const slug = existing.slug;
+      const entityPath = join(entityDir, `${slug}.md`);
+      const rawPath = join(rawDir, `${slug}.json`);
+      const page = splitPage(existing.content);
+      // Task 5: Sanitize aliases before persisting
+      const mergedAliases = sanitizeAliases(Array.from(new Set([entityName]
+        .concat(aliases)
+        .concat([extractTitle(existing.content)])
+        .concat(parseAliases(existing.content))
+        .filter(Boolean)
+        .map(normalizeEntityName))));
+      const compiled = buildTemplateCompiledContent(entityName, page.compiled, relatedNames, date, message);
+      const timeline = mode === 'sender'
+        ? appendTimelineEntry(page.timeline, entityName, message)
+        : appendMentionTimelineEntry(page.timeline, entityName, message);
+      const frontmatter = buildManagedFrontmatter(page.frontmatter || {}, mergedAliases, date);
+      atomicWrite(entityPath, `${serializeFrontmatter(frontmatter)}\n\n${compiled}\n\n---\n\n${timeline}\n`);
+
+      const raw = readJson(rawPath, { messages: [] });
+      if (!raw.messages.some(entry => entry.id === message.id)) {
+        raw.messages.push(message);
+      }
+      atomicWrite(rawPath, JSON.stringify(raw, null, 2));
+      return { slug, path: entityPath, title: entityName, dir: dirName };
+    }
+  }
+
+  // Task 2: For mentions without an existing page match, require higher confidence to create
+  if (mode === 'mention' && !existing) {
+    // Only create mention pages for catalog matches or strong regex evidence
+    // Catalog matches come with pre-existing pages, so if we're here it's a regex-only candidate
+    // Check if we have enough evidence to create
+    const candidateTokens = significantTokens(entityName);
+    if (candidateTokens.length === 0) {
+      if (collectorBaseDir) {
+        writeUnresolvedCandidate(collectorBaseDir, {
+          message_id: message.id, date, kind: 'mention', candidate_name: entityName,
+          candidate_aliases: aliases, source: mode,
+          reason: 'Mention candidate has zero significant tokens — skipped creation',
+          top_matches: [],
+        });
+      }
+      return null;
+    }
+  }
+
+  // Create new page
+  const slug = slugify(entityName);
   const entityPath = join(entityDir, `${slug}.md`);
   const rawPath = join(rawDir, `${slug}.json`);
-  const existingContent = existing?.content || '';
-  const page = splitPage(existingContent);
-  const mergedAliases = Array.from(new Set([entityName]
-    .concat(aliases)
-    .concat(existing ? [extractTitle(existing.content)] : [])
-    .concat(existing ? parseAliases(existing.content) : [])
-    .filter(Boolean)
-    .map(normalizeEntityName)));
+  const page = splitPage('');
+  // Task 5: Sanitize aliases for new pages too
+  const cleanAliases = sanitizeAliases([entityName, ...aliases].filter(Boolean).map(normalizeEntityName));
+  const uniqueAliases = Array.from(new Set(cleanAliases));
   const compiled = buildTemplateCompiledContent(entityName, page.compiled, relatedNames, date, message);
   const timeline = mode === 'sender'
     ? appendTimelineEntry(page.timeline, entityName, message)
     : appendMentionTimelineEntry(page.timeline, entityName, message);
-  const frontmatter = buildManagedFrontmatter(page.frontmatter || {}, mergedAliases, date);
+  const frontmatter = buildManagedFrontmatter(page.frontmatter || {}, uniqueAliases, date);
   atomicWrite(entityPath, `${serializeFrontmatter(frontmatter)}\n\n${compiled}\n\n---\n\n${timeline}\n`);
 
   const raw = readJson(rawPath, { messages: [] });
@@ -821,6 +1163,11 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
     const senderDir = resolveEntityDir(brainDir, senderKind);
     validateEntityAgainstLocalResolver(brainDir, senderDir, senderKind);
 
+    // Task 2: Sender quality gate — skip junk sender names
+    if (!isViableSenderEntity(sender.displayName)) {
+      continue;
+    }
+
     const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
     const entitiesForMessage = [
       {
@@ -846,8 +1193,8 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
       const relatedNames = entitiesForMessage
         .filter(other => normalizeEntityName(other.name).toLowerCase() !== normalizeEntityName(entity.name).toLowerCase())
         .map(other => other.name);
-      upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases, relatedNames, date, message, entity.mode);
-      updated += 1;
+      const result = upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases, relatedNames, date, message, entity.mode, baseDir);
+      if (result) updated += 1;
     }
   }
 
