@@ -3,6 +3,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { spawnSync } from 'child_process';
+import YAML from 'yaml';
 
 const NOISE_PATTERNS = ['noreply', 'no-reply', 'notifications@', 'calendar-notification', 'mailer-daemon', 'postmaster', 'donotreply'];
 const SIGNATURE_PATTERNS = [
@@ -441,10 +442,39 @@ function parseInlineArray(body) {
   return values;
 }
 
+function parseFrontmatterRaw(raw) {
+  try {
+    const parsed = YAML.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    const frontmatter = {};
+    for (const line of String(raw || '').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.includes(':')) continue;
+      const idx = trimmed.indexOf(':');
+      const key = trimmed.slice(0, idx).trim();
+      const value = trimmed.slice(idx + 1).trim();
+      if ((key === 'aliases' || key === 'tags') && value.startsWith('[') && value.endsWith(']')) {
+        frontmatter[key] = parseInlineArray(value.slice(1, -1));
+      } else {
+        frontmatter[key] = stripWrappingQuotes(value);
+      }
+    }
+    return frontmatter;
+  }
+}
+
 function parseAliases(content) {
-  const match = content.match(/aliases:\s*\[(.*?)\]/s);
-  if (!match) return [];
-  return parseInlineArray(match[1]);
+  const text = String(content || '');
+  if (!text.startsWith('---\n')) return [];
+  const end = text.indexOf('\n---\n', 4);
+  if (end === -1) return [];
+  const raw = text.slice(4, end).trim();
+  const frontmatter = parseFrontmatterRaw(raw);
+  const aliases = frontmatter.aliases;
+  if (Array.isArray(aliases)) return aliases.map(a => String(a)).map(normalizeEntityName).filter(Boolean);
+  if (typeof aliases === 'string') return parseInlineArray(String(aliases).replace(/^\[|\]$/g, '')).map(normalizeEntityName).filter(Boolean);
+  return [];
 }
 
 function extractTitle(content) {
@@ -593,7 +623,7 @@ function scoreEntityMatch(candidateName, candidateAliases, page) {
   return (intersection / union) * 0.8;
 }
 
-function findBestEntityPage(entityDir, candidates, candidateAliases) {
+function findBestEntityPageWithScore(entityDir, candidates, candidateAliases) {
   const pages = listEntityPages(entityDir);
   let bestPage = null;
   let bestScore = 0;
@@ -608,7 +638,37 @@ function findBestEntityPage(entityDir, candidates, candidateAliases) {
     }
   }
 
-  return bestScore >= MATCH_THRESHOLD ? bestPage : null;
+  if (bestScore < MATCH_THRESHOLD || !bestPage) return null;
+  return { page: bestPage, score: bestScore };
+}
+
+function findBestEntityPage(entityDir, candidates, candidateAliases) {
+  return findBestEntityPageWithScore(entityDir, candidates, candidateAliases)?.page || null;
+}
+
+function findBestEntityPageAcrossTypes(brainDir, candidates, candidateAliases) {
+  const matches = [];
+  for (const dirName of ['people', 'companies']) {
+    const entityDir = join(resolve(brainDir), dirName);
+    if (!existsSync(entityDir)) continue;
+    const result = findBestEntityPageWithScore(entityDir, candidates, candidateAliases);
+    if (result) matches.push({ ...result, dirName });
+  }
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => b.score - a.score);
+  const [best, second] = matches;
+  const ambiguous = Boolean(
+    second &&
+    (best.dirName !== second.dirName || best.page.slug !== second.page.slug) &&
+    Math.abs(best.score - second.score) < 0.05
+  );
+  return {
+    page: best.page,
+    score: best.score,
+    dirName: best.dirName,
+    ambiguous,
+    candidates: matches.map(match => ({ slug: match.page.slug, title: match.page.title, dirName: match.dirName, score: match.score })),
+  };
 }
 
 function isPlausibleAliasMatch(newName, existingTitle) {
@@ -823,20 +883,7 @@ function parseFrontmatter(content) {
   }
   const raw = text.slice(4, end).trim();
   const body = text.slice(end + 5).trim();
-  const frontmatter = {};
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || !trimmed.includes(':')) continue;
-    const idx = trimmed.indexOf(':');
-    const key = trimmed.slice(0, idx).trim();
-    const value = trimmed.slice(idx + 1).trim();
-    if ((key === 'aliases' || key === 'tags') && value.startsWith('[') && value.endsWith(']')) {
-      frontmatter[key] = parseInlineArray(value.slice(1, -1));
-    } else {
-      frontmatter[key] = stripWrappingQuotes(value);
-    }
-  }
-  return { frontmatter, body };
+  return { frontmatter: parseFrontmatterRaw(raw), body };
 }
 
 function splitPage(content) {
@@ -926,14 +973,53 @@ function buildSeeAlsoBlock(existingCompiled, relatedNames) {
   return names.map(name => `- [[${name}]]`).join('\n');
 }
 
+function addDays(dateStr, days) {
+  const d = new Date(dateStr);
+  if (Number.isNaN(d.getTime())) return null;
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function extractActionItems(message) {
+  const text = [message.body, message.snippet, message.subject].filter(Boolean).join('\n');
+  if (!text.trim()) return [];
+  const cleaned = text
+    .replace(/\r/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[•·]+/g, ' ')
+    .trim();
+  const parts = cleaned.split(/(?<=[.!?])\s+/);
+  const items = [];
+  const seen = new Set();
+  for (let part of parts) {
+    part = part.trim().replace(/[.!?]+$/g, '');
+    const lower = part.toLowerCase();
+    if (!part) continue;
+    if (part.length < 12 || part.length > 180) continue;
+    if (/header logo|unread notifications|member sign in|^sign in$|^log in$|^login$/.test(lower)) continue;
+    if (!/(please|reply|review|confirm|send|update|schedule|call|follow up|check|share|sign|complete|continue|verify|ask|include|loop in|meet)/i.test(part)) continue;
+    let bullet = `- [ ] ${part}`;
+    if (/before tomorrow|by tomorrow|tomorrow/.test(lower)) {
+      const due = addDays(message.date || new Date().toISOString(), 1);
+      if (due) bullet += ` (due ${due})`;
+    }
+    if (seen.has(bullet)) continue;
+    seen.add(bullet);
+    items.push(bullet);
+  }
+  return items;
+}
+
 function buildTemplateCompiledContent(title, existingCompiled, relatedNames, date, message) {
   const summary = normalizeBulletBlock(
     extractSubsection(existingCompiled, 'Summary'),
     `- Auto-created from email collector.\n- Tracks email-derived context for ${title}.`
   );
-  const openThreads = normalizeBulletBlock(
+  const openThreads = mergeBulletBlocks(
     extractSubsection(existingCompiled, 'Open Threads'),
-    '- [ ] Review latest email context if action is needed'
+    Array.isArray(message.action_items) && message.action_items.length > 0
+      ? message.action_items
+      : ['- [ ] Review latest email context if action is needed']
   );
   const currentState = mergeBulletBlocks(
     extractSubsection(existingCompiled, 'Current State'),
@@ -992,8 +1078,9 @@ function buildManagedFrontmatter(existingFrontmatter, aliases, date) {
 }
 
 function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, date, message, mode, collectorBaseDir) {
-  const entityDir = join(resolve(brainDir), dirName);
-  const rawDir = join(entityDir, '.raw');
+  let currentDirName = dirName;
+  let entityDir = join(resolve(brainDir), currentDirName);
+  let rawDir = join(entityDir, '.raw');
   ensureDir(entityDir);
   ensureDir(rawDir);
 
@@ -1013,15 +1100,50 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
   // Task 1+6: Use scored matching instead of first-match-wins
   const allCandidates = [entityName, ...aliases].filter(Boolean);
   const mergeThreshold = mode === 'sender' ? SENDER_MERGE_THRESHOLD : MENTION_MERGE_THRESHOLD;
-  const existing = findBestEntityPage(entityDir, allCandidates, aliases);
+  let existingMatch = findBestEntityPageWithScore(entityDir, allCandidates, aliases);
+
+  // Sender-only cross-type check: if classification points at the wrong dir,
+  // try the other type before creating a new page. Also bail out when the same
+  // sender matches equally well in both people/ and companies/.
+  if (mode === 'sender') {
+    const crossTypeResult = findBestEntityPageAcrossTypes(brainDir, allCandidates, aliases);
+    if (crossTypeResult?.ambiguous) {
+      if (collectorBaseDir) {
+        writeUnresolvedCandidate(collectorBaseDir, {
+          message_id: message.id,
+          date,
+          kind: 'sender',
+          candidate_name: entityName,
+          candidate_aliases: aliases,
+          source: mode,
+          reason: 'Cross-type sender match is ambiguous',
+          top_matches: crossTypeResult.candidates,
+        });
+      }
+      return null;
+    }
+    if (!existingMatch && crossTypeResult && crossTypeResult.dirName !== currentDirName) {
+      if (crossTypeResult.score >= 0.8 && isPlausibleAliasMatch(entityName, crossTypeResult.page.title)) {
+        currentDirName = crossTypeResult.dirName;
+        entityDir = join(resolve(brainDir), currentDirName);
+        rawDir = join(entityDir, '.raw');
+        ensureDir(entityDir);
+        ensureDir(rawDir);
+        existingMatch = { page: crossTypeResult.page, score: crossTypeResult.score };
+      }
+    }
+  }
+
+  const existing = existingMatch?.page || null;
 
   // Task 6: Score-based merge guard with secondary token overlap check
   if (existing) {
-    // Compute best score for this match
-    let bestScore = 0;
-    for (const candidate of allCandidates) {
-      const s = scoreEntityMatch(candidate, aliases, existing);
-      if (s > bestScore) bestScore = s;
+    let bestScore = existingMatch?.score || 0;
+    if (!bestScore) {
+      for (const candidate of allCandidates) {
+        const s = scoreEntityMatch(candidate, aliases, existing);
+        if (s > bestScore) bestScore = s;
+      }
     }
 
     if (bestScore < mergeThreshold) {
@@ -1079,7 +1201,7 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
         raw.messages.push(message);
       }
       atomicWrite(rawPath, JSON.stringify(raw, null, 2));
-      return { slug, path: entityPath, title: entityName, dir: dirName };
+      return { slug, path: entityPath, title: entityName, dir: currentDirName };
     }
   }
 
@@ -1122,7 +1244,7 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
     raw.messages.push(message);
   }
   atomicWrite(rawPath, JSON.stringify(raw, null, 2));
-  return { slug, path: entityPath, title: entityName, dir: dirName };
+  return { slug, path: entityPath, title: entityName, dir: currentDirName };
 }
 
 function runCommand(bin, args, cwd, input) {
@@ -1169,7 +1291,8 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
   let updated = 0;
   const updatedPages = [];
   for (const message of records.filter(msg => !msg.is_noise)) {
-    const sender = parseSender(message.from);
+    const enrichedMessage = { ...message, action_items: extractActionItems(message) };
+    const sender = parseSender(enrichedMessage.from);
     const senderKind = classifySenderEntityKind(sender);
     const senderDir = resolveEntityDir(brainDir, senderKind);
     validateEntityAgainstLocalResolver(brainDir, senderDir, senderKind);
@@ -1179,7 +1302,7 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
       continue;
     }
 
-    const mentions = detectMentionedEntities(message, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
+    const mentions = detectMentionedEntities(enrichedMessage, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
     const entitiesForMessage = [
       {
         name: sender.displayName,
@@ -1204,7 +1327,7 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
       const relatedNames = entitiesForMessage
         .filter(other => normalizeEntityName(other.name).toLowerCase() !== normalizeEntityName(entity.name).toLowerCase())
         .map(other => other.name);
-      const result = upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases, relatedNames, date, message, entity.mode, baseDir);
+      const result = upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases, relatedNames, date, enrichedMessage, entity.mode, baseDir);
       if (!result) continue;
       updatedPages.push(result);
       updated += 1;
