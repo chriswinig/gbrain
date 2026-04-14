@@ -171,7 +171,7 @@ function formatResult(opName: string, result: unknown): string {
       const results = result as any[];
       if (results.length === 0) return 'No results.\n';
       return results.map(r =>
-        `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
+        `[${r.score?.toFixed(4) || '?'}] ${r.slug}${r.graph_depth ? ` [graph d${r.graph_depth}${r.graph_source_slugs?.length ? ` via ${r.graph_source_slugs.join(', ')}` : ''}]` : ''} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
     }
     case 'get_tags': {
@@ -388,9 +388,9 @@ PAGES
   list [--type T] [--tag T] [-n N]   List pages
 
 SEARCH
-  search <query>                     Keyword search (tsvector)
-  query <question> [--no-expand]     Hybrid search (RRF + expansion)
-  ask <question> [--no-expand]       Alias for query
+  search <query> [--graph-depth N]   Keyword search (tsvector, optional graph traversal)
+  query <question> [--no-expand] [--graph-depth N]  Hybrid search (RRF + expansion, optional graph traversal)
+  ask <question> [--no-expand] [--graph-depth N]    Alias for query
 
 IMPORT/EXPORT
   import <dir> [--no-embed]          Import markdown directory

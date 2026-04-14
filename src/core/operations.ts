@@ -6,7 +6,7 @@
 import type { BrainEngine } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import { importFromContent } from './import-file.ts';
-import { hybridSearch } from './search/hybrid.ts';
+import { hybridSearch, applyGraphExpansion } from './search/hybrid.ts';
 import { expandQuery } from './search/expansion.ts';
 import * as db from './db.ts';
 
@@ -177,9 +177,15 @@ const search: Operation = {
     query: { type: 'string', required: true },
     limit: { type: 'number', description: 'Max results (default 20)' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
+    graph_depth: { type: 'number', description: 'Optionally follow outgoing/backlinks from result pages (max 2 hops)' },
   },
   handler: async (ctx, p) => {
-    return ctx.engine.searchKeyword(p.query as string, {
+    const baseResults = await ctx.engine.searchKeyword(p.query as string, {
+      limit: (p.limit as number) || 20,
+      offset: (p.offset as number) || 0,
+    });
+    return applyGraphExpansion(ctx.engine, baseResults, {
+      graphDepth: p.graph_depth as number | undefined,
       limit: (p.limit as number) || 20,
       offset: (p.offset as number) || 0,
     });
@@ -195,6 +201,7 @@ const query: Operation = {
     limit: { type: 'number', description: 'Max results (default 20)' },
     offset: { type: 'number', description: 'Skip first N results (for pagination)' },
     expand: { type: 'boolean', description: 'Enable multi-query expansion (default: true)' },
+    graph_depth: { type: 'number', description: 'Optionally follow outgoing/backlinks from result pages (max 2 hops)' },
   },
   handler: async (ctx, p) => {
     const expand = p.expand !== false;
@@ -203,6 +210,7 @@ const query: Operation = {
       offset: (p.offset as number) || 0,
       expansion: expand,
       expandFn: expand ? expandQuery : undefined,
+      graphDepth: p.graph_depth as number | undefined,
     });
   },
   cliHints: { name: 'query', positional: ['query'] },

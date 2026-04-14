@@ -103,6 +103,7 @@ Once GBrain is installed, your agent needs data flowing in. GBrain ships integra
 | [Email-to-Brain](recipes/email-to-brain.md) | credential-gateway | Gmail → entity pages (deterministic collector) |
 | [X-to-Brain](recipes/x-to-brain.md) | — | Twitter → brain pages (timeline + mentions + deletions) |
 | [Calendar-to-Brain](recipes/calendar-to-brain.md) | credential-gateway | Google Calendar → searchable daily pages |
+| [Telegram-Transcript-to-Brain](recipes/telegram-transcript-to-brain.md) | — | Hermes Telegram session transcripts → compiled-truth brain pages with dedupe |
 | [Meeting Sync](recipes/meeting-sync.md) | — | Circleback transcripts → brain pages with attendees |
 
 Run `gbrain integrations` to see status. Dependencies resolve automatically. See [Getting Data In](docs/integrations/README.md) for the full guide.
