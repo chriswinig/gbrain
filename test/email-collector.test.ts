@@ -829,4 +829,538 @@ print('ok')
     expect(calls[0].args).toEqual(['import', brainDir, '--no-embed']);
     expect(calls[1].args).toEqual(['embed', '--stale']);
   });
+
+  // === Task 7: Regression tests for known failure shapes ===
+
+  test('enrich does not merge unrelated entity into page with broad alias "X"', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    // Pre-seed twitter.md with alias "X"
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(companiesDir, { recursive: true });
+    writeFileSync(join(companiesDir, 'twitter.md'), `---
+aliases: ["Twitter", "X"]
+tags: []
+status: active
+created: 2026-04-01
+---
+
+# Twitter
+
+## Compiled Truth
+
+### Summary
+- Social media platform
+
+### Current State
+- Rebranded to X
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'elegant-1',
+      from: 'Elegant Themes, Inc. <newsletter@elegantthemes.com>',
+      subject: 'New Divi features',
+      snippet: 'Check out what is new in Divi',
+      body: 'Elegant Themes newsletter about Divi features.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/elegant-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/elegant-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // Twitter page must NOT contain Elegant Themes
+    const twitter = readFileSync(join(companiesDir, 'twitter.md'), 'utf-8');
+    expect(twitter).not.toContain('Elegant Themes');
+    // Elegant Themes should get its own page
+    expect(existsSync(join(companiesDir, 'elegant-themes-inc.md'))).toBe(true);
+  });
+
+  test('enrich does not create pages for generic noise words from snippets', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'noise-1',
+      from: 'Jane Doe <jane@example.com>',
+      subject: 'Update from Support about Billing',
+      snippet: 'Notification from the team about account updates via Support',
+      body: 'Generic noise test.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/noise-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/noise-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // None of these noise words should become standalone pages
+    expect(existsSync(join(brainDir, 'companies', 'support.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'companies', 'notification.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'companies', 'billing.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'people', 'support.md'))).toBe(false);
+    // Sender page should still be created
+    expect(existsSync(join(brainDir, 'people', 'jane-doe.md'))).toBe(true);
+  });
+
+  test('enrich skips junk sender names like Feedback or Notification', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'junk-sender-1',
+      from: 'Feedback <feedback@service.com>',
+      subject: 'Your feedback was received',
+      snippet: 'Thanks for your feedback',
+      body: 'Feedback confirmation.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/junk-sender-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/junk-sender-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // Feedback should not become an entity page
+    expect(existsSync(join(brainDir, 'companies', 'feedback.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'people', 'feedback.md'))).toBe(false);
+  });
+
+  test('enrich sanitizes pipe-delimited sender names like "2020 | Cyncly"', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'cyncly-1',
+      from: '2020 | Cyncly <info@cyncly.com>',
+      subject: 'Product update',
+      snippet: 'Latest from Cyncly',
+      body: 'Cyncly product update.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/cyncly-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/cyncly-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // Should create cyncly.md, NOT "2020---cyncly.md" or "2020-cyncly.md"
+    expect(existsSync(join(brainDir, 'companies', 'cyncly.md'))).toBe(true);
+    expect(existsSync(join(brainDir, 'companies', '2020---cyncly.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'companies', '2020-cyncly.md'))).toBe(false);
+    const page = readFileSync(join(brainDir, 'companies', 'cyncly.md'), 'utf-8');
+    expect(page).toContain('# Cyncly');
+  });
+
+  test('enrich writes unresolved candidate report when token overlap guard rejects merge', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    // Pre-seed twitter.md with alias "X"
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(companiesDir, { recursive: true });
+    writeFileSync(join(companiesDir, 'twitter.md'), `---
+aliases: ["Twitter", "X"]
+tags: []
+status: active
+created: 2026-04-01
+---
+
+# Twitter
+
+## Compiled Truth
+
+### Summary
+- Social media platform
+
+### Current State
+- Active
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    // Send mail from sender "X" at stripe — should NOT merge into Twitter
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'ambig-x-1',
+      from: 'X <invoice+statements+acct_123@stripe.com>',
+      subject: 'Your invoice',
+      snippet: 'Invoice attached',
+      body: 'Your invoice from Stripe.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/ambig-x-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/ambig-x-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // Twitter should NOT be contaminated
+    const twitter = readFileSync(join(companiesDir, 'twitter.md'), 'utf-8');
+    expect(twitter).not.toContain('invoice');
+    expect(twitter).not.toContain('stripe');
+    // Unresolved report should exist OR a separate x.md should be created
+    const unresolvedDir = join(dir, 'data', 'reports', 'unresolved-entities');
+    const hasUnresolved = existsSync(join(unresolvedDir, '2026-04-12.json'));
+    const hasSeparatePage = existsSync(join(companiesDir, 'x.md'));
+    expect(hasUnresolved || hasSeparatePage).toBe(true);
+  });
+
+  test('enrich sender with strong domain evidence still creates correct company page', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'domain-1',
+      from: 'Stripe <notifications@stripe.com>',
+      subject: 'Your invoice is ready',
+      snippet: 'Invoice for April',
+      body: 'Your April invoice from Stripe.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/domain-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/domain-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    expect(existsSync(join(brainDir, 'companies', 'stripe.md'))).toBe(true);
+    const page = readFileSync(join(brainDir, 'companies', 'stripe.md'), 'utf-8');
+    expect(page).toContain('# Stripe');
+    expect(page).toContain('## Timeline');
+  });
+
+  test('existing catalog match with strong alias still works for mentions', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(companiesDir, { recursive: true });
+    writeFileSync(join(companiesDir, 'acme-corp.md'), `---
+aliases: ["Acme Corp"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Acme Corp
+
+## Compiled Truth
+
+### Summary
+- Existing company
+
+### Current State
+- Active
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'catalog-1',
+      from: 'Jane Doe <jane@example.com>',
+      subject: 'Meeting with Acme Corp',
+      snippet: 'Discussed partnership with Acme Corp',
+      body: 'Met with Acme Corp to discuss partnership.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/catalog-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/catalog-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // Acme Corp page should be updated (not duplicated)
+    const page = readFileSync(join(companiesDir, 'acme-corp.md'), 'utf-8');
+    expect(page).toContain('Acme Corp was mentioned');
+    expect(page).toContain('- [[Jane Doe]]');
+  });
+
+  test('weak aliases like "X" are not persisted into frontmatter for new pages', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'weak-alias-1',
+      from: 'X <invoice+statements+acct_123@stripe.com>',
+      subject: 'Your receipt',
+      snippet: 'Receipt attached',
+      body: 'Your receipt for April.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/weak-alias-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/weak-alias-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    // X is a weak alias and should be filtered from frontmatter
+    const files = existsSync(join(brainDir, 'companies', 'x.md'))
+      ? readFileSync(join(brainDir, 'companies', 'x.md'), 'utf-8')
+      : '';
+    if (files) {
+      // If a page was created, the alias "X" should not be in frontmatter
+      const aliasMatch = files.match(/aliases:\s*\[(.*?)\]/s);
+      if (aliasMatch) {
+        const aliases = aliasMatch[1].split(',').map(a => a.trim().replace(/^"|"$/g, ''));
+        expect(aliases).not.toContain('X');
+        expect(aliases).not.toContain('x');
+      }
+    }
+  });
+
+  test('enrich repairs aliases containing commas and quoted titles without splitting them', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'merch-method-inc.md'), `---
+aliases: [""Merch Method, Inc"", "customerservice@merchmethod.com"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# "Merch Method, Inc"
+
+## Compiled Truth
+
+### Summary
+- Existing note
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'merch-1',
+      from: 'Jane Doe <jane@example.com>',
+      subject: 'Merch update',
+      snippet: 'Merch Method, Inc is ready',
+      body: 'Please review the update from Merch Method, Inc.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/merch-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/merch-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const person = readFileSync(join(peopleDir, 'merch-method-inc.md'), 'utf-8');
+    expect(person).toContain('aliases: ["Merch Method, Inc", "customerservice@merchmethod.com"]');
+    expect(person).not.toContain('""Merch Method, Inc""');
+    expect(person).toContain('# Merch Method, Inc');
+  });
+
+  test('enrich routes Experian Alerts support sender into companies not people', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'experian-1',
+      from: 'Experian Alerts <support@s.usa.experian.com>',
+      subject: 'Your FICO® Score changed',
+      snippet: 'See where your Experian credit file stands.',
+      body: 'Sign in to review the latest alert from Experian.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/experian-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/experian-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    expect(existsSync(join(brainDir, 'companies', 'experian-alerts.md'))).toBe(true);
+    expect(existsSync(join(brainDir, 'people', 'experian-alerts.md'))).toBe(false);
+  });
+
+  test('enrich preserves existing Current State bullets instead of overwriting them', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'jane-doe.md'), `---
+aliases: ["Jane Doe", "jane@example.com"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Jane Doe
+
+## Compiled Truth
+
+### Summary
+- Existing note
+
+### Current State
+- Previously touched
+- Waiting on reply from Jane
+
+### Open Threads
+- [ ] Existing thread
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'state-1',
+      from: 'Jane Doe <jane@example.com>',
+      subject: 'Following up',
+      snippet: 'Checking in',
+      body: 'Just following up.',
+      date: '2026-04-12T11:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/state-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/state-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const person = readFileSync(join(peopleDir, 'jane-doe.md'), 'utf-8');
+    expect(person).toContain('- Previously touched');
+    expect(person).toContain('- Waiting on reply from Jane');
+    expect(person).toContain('- Latest email subject: Following up');
+  });
+
+  test('enrich deduplicates unresolved candidate records across reruns', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(companiesDir, { recursive: true });
+    writeFileSync(join(companiesDir, 'twitter.md'), `---
+aliases: ["Twitter", "X"]
+tags: []
+status: active
+created: 2026-04-01
+---
+
+# Twitter
+
+## Compiled Truth
+
+### Summary
+- Social media platform
+
+### Current State
+- Active
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'ambig-x-dedupe',
+      from: 'X <invoice+statements+acct_123@stripe.com>',
+      subject: 'Your invoice',
+      snippet: 'Invoice attached',
+      body: 'Your invoice from Stripe.',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/ambig-x-dedupe',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/ambig-x-dedupe)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    for (let i = 0; i < 2; i++) {
+      const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+        cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+      });
+      expect(await proc.exited).toBe(0);
+    }
+
+    const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
+    expect(unresolved).toHaveLength(1);
+    expect(unresolved[0].message_id).toBe('ambig-x-dedupe');
+  });
 });
