@@ -87,7 +87,8 @@ parity), `test/cli.test.ts` (CLI structure), `test/config.test.ts` (config redac
 `test/publish.test.ts` (content stripping, encryption, password generation, HTML output),
 `test/backlinks.test.ts` (entity extraction, back-link detection, timeline entry generation),
 `test/lint.test.ts` (LLM artifact detection, code fence stripping, frontmatter validation),
-`test/report.test.ts` (report format, directory structure).
+`test/report.test.ts` (report format, directory structure),
+`test/search-noise.test.ts` (pre-RRF page collapse, slug-prefix weight penalties).
 
 E2E tests (`test/e2e/`): Run against real Postgres+pgvector. Require `DATABASE_URL`.
 - `bun run test:e2e` runs Tier 1 (mechanical, all operations, no API keys)
