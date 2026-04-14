@@ -1125,10 +1125,11 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
   return { slug, path: entityPath, title: entityName, dir: dirName };
 }
 
-function runCommand(bin, args, cwd) {
+function runCommand(bin, args, cwd, input) {
   const result = spawnSync(bin, args, {
     cwd,
     encoding: 'utf8',
+    input,
   });
   if (result.status !== 0) {
     throw new Error(`${bin} ${args.join(' ')} failed: ${(result.stderr || result.stdout || '').trim()}`);
@@ -1136,13 +1137,22 @@ function runCommand(bin, args, cwd) {
   return (result.stdout || '').trim();
 }
 
-function syncBrain(brainDir, gbrainBin, embedStale) {
+function putBrainPage(brainDir, gbrainBin, slug, filePath) {
   const binary = gbrainBin || 'gbrain';
+  const content = readFileSync(filePath, 'utf8');
+  return runCommand(binary, ['put', slug], resolve(brainDir), content);
+}
+
+function syncBrain(brainDir, gbrainBin, updatedPages, embedStale) {
+  const dedupedPages = Array.from(new Map((updatedPages || []).map(page => [`${page.dir}/${page.slug}`, page])).values());
   const output = {
-    import: runCommand(binary, ['import', resolve(brainDir), '--no-embed'], resolve(brainDir)),
+    puts: dedupedPages.map(page => ({
+      slug: `${page.dir}/${page.slug}`,
+      output: putBrainPage(brainDir, gbrainBin, `${page.dir}/${page.slug}`, page.path),
+    })),
   };
   if (embedStale) {
-    output.embed = runCommand(binary, ['embed', '--stale'], resolve(brainDir));
+    output.embed = 'handled by gbrain put per updated page';
   }
   return output;
 }
@@ -1157,6 +1167,7 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
   const records = readJson(messagesPath(baseDir, date), []);
 
   let updated = 0;
+  const updatedPages = [];
   for (const message of records.filter(msg => !msg.is_noise)) {
     const sender = parseSender(message.from);
     const senderKind = classifySenderEntityKind(sender);
@@ -1194,11 +1205,13 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
         .filter(other => normalizeEntityName(other.name).toLowerCase() !== normalizeEntityName(entity.name).toLowerCase())
         .map(other => other.name);
       const result = upsertEntityPage(brainDir, entity.dir, entity.name, entity.aliases, relatedNames, date, message, entity.mode, baseDir);
-      if (result) updated += 1;
+      if (!result) continue;
+      updatedPages.push(result);
+      updated += 1;
     }
   }
 
-  const syncResult = syncAfterEnrich ? syncBrain(brainDir, gbrainBin, embedStale) : null;
+  const syncResult = syncAfterEnrich ? syncBrain(brainDir, gbrainBin, updatedPages, embedStale) : null;
   return { date, updated, sync: syncResult };
 }
 
