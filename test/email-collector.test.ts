@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -90,6 +90,45 @@ function writeResolver(brainDir: string) {
   writeFileSync(join(brainDir, 'people', 'README.md'), TEST_PEOPLE_README);
   writeFileSync(join(brainDir, 'companies', 'README.md'), TEST_COMPANIES_README);
   writeFileSync(join(brainDir, '_templates', 'compiled-truth-timeline.md'), TEST_TEMPLATE);
+}
+
+function readAllRawMessages(brainDir: string): any[] {
+  const messages: any[] = [];
+  for (const dirName of ['people', 'companies']) {
+    const rawDir = join(brainDir, dirName, '.raw');
+    if (!existsSync(rawDir)) continue;
+    for (const entry of readdirSync(rawDir)) {
+      if (!entry.endsWith('.json')) continue;
+      const payload = JSON.parse(readFileSync(join(rawDir, entry), 'utf-8'));
+      if (Array.isArray(payload.messages)) messages.push(...payload.messages);
+    }
+  }
+  return messages;
+}
+
+async function enrichFixtureMessages(date: string, records: any[]) {
+  const dir = makeTempDir();
+  const brainDir = join(dir, 'brain');
+  writeResolver(brainDir);
+  await Bun.$`node ${scriptPath} init --dir ${dir}`;
+  writeFileSync(join(dir, 'data', 'messages', `${date}.json`), JSON.stringify(records, null, 2));
+  const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', date], {
+    cwd: repoRoot,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const stderr = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+  expect(exitCode).toBe(0);
+  expect(stderr).toBe('');
+  return readAllRawMessages(brainDir);
+}
+
+async function loadActionExtractor() {
+  const testablePath = join(repoRoot, `.email-collector-testable-${Date.now()}.mjs`);
+  const source = readFileSync(scriptPath, 'utf-8').replace(/\nmain\(\);\s*$/, '\nexport { extractActionItems };\n');
+  writeFileSync(testablePath, source);
+  return await import(`file://${testablePath}`);
 }
 
 describe('email collector scaffold', () => {
@@ -2252,5 +2291,299 @@ created: 2022-12-31
     expect(page).not.toContain('address book');
     expect(page).not.toContain('Log in Your payment is complete');
     expect(page).toContain('- [ ] Review latest email context if action is needed');
+  });
+
+  test('rerun cleans previously-written junk bullets from existing Open Threads', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    mkdirSync(join(companiesDir, '.raw'), { recursive: true });
+
+    writeFileSync(join(peopleDir, 'chris-winig.md'), `---
+aliases: ["Chris Winig", "Christopher Winig", "chris.winig@gmail.com"]
+tags: []
+status: active
+created: 2026-04-12
+---
+
+# Chris Winig
+
+## Compiled Truth
+
+### Summary
+- Existing note
+
+### Current State
+- Existing state
+
+### Open Threads
+- [ ] I just checked
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+
+    writeFileSync(join(companiesDir, 'square-inc.md'), `---
+aliases: ["Square Reports", "noreply@messaging.squareup.com", "Square Inc"]
+tags: []
+status: active
+created: 2020-12-31
+---
+
+# Square Reports
+
+## Compiled Truth
+
+### Summary
+- Existing note
+
+### Current State
+- Existing state
+
+### Open Threads
+- [ ] With Square Checking, get instant access to your Square sales with no monthly fees and no minimums
+- [ ] See what Square Checking has to offer https://squareup.com/us/en/banking/checking ----- © 2026 Block, Inc
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-15.json'), JSON.stringify([
+      {
+        id: 'clean-junk-1',
+        from: 'Christopher Winig <chris.winig@gmail.com>',
+        subject: 'Re: Your iCloud storage is full.',
+        snippet: 'I just checked. Your icloud storage has plenty of storage.',
+        body: 'I just checked. Your icloud storage has plenty of storage. Not sure why they sent you that. - Chris',
+        date: '2026-04-15T00:10:22Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me#inbox/clean-junk-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me#inbox/clean-junk-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      },
+      {
+        id: 'clean-junk-2',
+        from: 'Square Reports <noreply@messaging.squareup.com>',
+        subject: 'Wingate LTD—Your Daily Sales Summary Report for April 14, 2026',
+        snippet: 'Gross Sales: $0.10, Fees: ($0.05)',
+        body: 'Wingate LTD, your sales from Tuesday. Net Sales: $0.05. Fees: ($0.05). Tools to make tomorrow even better. It’s your money. Access it instantly. With Square Checking, get instant access to your Square sales with no monthly fees and no minimums. See what Square Checking has to offer https://squareup.com/us/en/banking/checking ----- © 2026 Block, Inc.',
+        date: '2026-04-15T04:46:33Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me#inbox/clean-junk-2',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me#inbox/clean-junk-2)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-15'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const person = readFileSync(join(peopleDir, 'chris-winig.md'), 'utf-8');
+    const company = readFileSync(join(companiesDir, 'square-inc.md'), 'utf-8');
+    expect(person).not.toContain('- [ ] I just checked');
+    expect(company).not.toContain('With Square Checking, get instant access to your Square sales');
+    expect(company).not.toContain('See what Square Checking has to offer');
+    expect(person).toContain('- [ ] Review latest email context if action is needed');
+    expect(company).toContain('- [ ] Review latest email context if action is needed');
+  });
+
+  test('20-email real-world eval set suppresses junk action items while keeping real ones', async () => {
+    const { extractActionItems } = await loadActionExtractor();
+    const cases = [
+      {
+        id: 'eval-figma-welcome',
+        from: 'Figma <announcements@figma.com>',
+        subject: 'Welcome to Figma!',
+        snippet: 'Your next steps inside',
+        body: 'Welcome to Figma. We bring you the tools to build in sync with your team, turn designs into code, and ship faster. Get started at developers.figma.com. Visit the Help Center. Figma is a design platform for teams who build products together.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-reliablerx-shipped',
+        from: 'ReliableRxPharmacy <noreply@reliablerxpharmacy.com>',
+        subject: 'Order Has Been Shipped',
+        snippet: 'This is an automated message and for your knowledge only. For any query, please send your query through Contact Us form. For more assistance chat with us.',
+        body: '',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-quoted-thread-chris',
+        from: 'Christopher Winig <chris.winig@gmail.com>',
+        subject: 'Re: Looking to clarify services/rates',
+        snippet: 'Did it work? - Chris',
+        body: 'Did it work?\n\n- Chris\n\nOn Wed, Apr 8, 2026 Christopher Winig wrote:\n> Hi Melissa,\n> Yes, that’s basically right.\n> - If you don’t want to continue working together, let’s align on that.\n> - Chris',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-quoted-thread-melissa',
+        from: 'Melissa Esposito <melissacesposito@gmail.com>',
+        subject: 'Re: Looking to clarify services/rates',
+        snippet: 'Hey Chris! Thanks for following up!',
+        body: 'Hey Chris! Thanks for following up!\n\nOn Wed, Apr 8, 2026 Christopher Winig wrote:\n> Hi Melissa,\n> Yes, that’s basically right.\n> - If you don’t want to continue working together, let’s align on that.\n> - Chris',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-cyncly-feedback',
+        from: '2020 | Cyncly <Feedback@feedback.cyncly.com>',
+        subject: 'Chris, how is your experience using Design?',
+        snippet: 'We’d love your feedback Chris, as a valued customer, we kindly invite you to share your thoughts about your experience using Design.',
+        body: 'We’d love your feedback Chris, as a valued customer, we kindly invite you to share your thoughts about your experience using Design. Your feedback will help us understand what to improve.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-valerie-forward',
+        from: 'Valerie Winig <valeriewinig@gmail.com>',
+        subject: 'Fwd: Your iCloud storage is full.',
+        snippet: 'Forwarded message from iCloud.',
+        body: '---------- Forwarded message ---------\nFrom: iCloud <noreply@email.apple.com>\nSubject: Your iCloud storage is full.\nHello Valerie Winig, your iCloud storage is full.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-jon-expo',
+        from: 'Jon Samp <jonsamp@expo.dev>',
+        subject: 'OTA updates is about more than hot fixes',
+        snippet: 'EAS Update is our over-the-air update service that lets you push JavaScript and asset changes instantly.',
+        body: 'EAS Update is our over-the-air update service that lets you push JavaScript and asset changes instantly. But that’s just one use case for EAS Update.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-usbank-payment',
+        from: 'U.S. Bank Alerts <usbank@notifications.usbank.com>',
+        subject: 'Your credit card payment is complete.',
+        snippet: 'Log in to mobile or online banking to view your payment. Your payment of $58.00 is complete.',
+        body: 'Log in to mobile or online banking to view your payment. Your payment of $58.00 is complete. Thanks for your payment.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-nitro-tickets',
+        from: 'Nitro Circus <shop-noreply@nitrocircus.com>',
+        subject: 'Are Your Nitro Circus 2.0 Tickets Locked In Yet?',
+        snippet: 'Don’t wait! Tickets are on sale now.',
+        body: 'Don’t wait! Tickets are on sale now. Get your tickets now at nitrocircus.com and make sure you are part of the action.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-square-report',
+        from: 'Square Reports <noreply@messaging.squareup.com>',
+        subject: 'Wingate LTD—Your Daily Sales Summary Report for April 14, 2026',
+        snippet: 'Gross Sales: $0.10, Fees: ($0.05)',
+        body: 'Wingate LTD, your sales from Tuesday. Net Sales: $0.05. Fees: ($0.05). Tools to make tomorrow even better. It’s your money. Access it instantly. With Square Checking, get instant access to your Square sales with no monthly fees and no minimums. See what Square Checking has to offer https://squareup.com/us/en/banking/checking ----- © 2026 Block, Inc.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-chris-checked',
+        from: 'Christopher Winig <chris.winig@gmail.com>',
+        subject: 'Re: Your iCloud storage is full.',
+        snippet: 'I just checked. Your icloud storage has plenty of storage.',
+        body: 'I just checked. Your icloud storage has plenty of storage. Not sure why they sent you that. - Chris',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-swisschems',
+        from: 'Swiss Chems <support_at_swisschems@icloud.com>',
+        subject: 'DMHA (Octodrine HCl) – Powder Format Available',
+        snippet: 'A research compound now available in 10g powder format.',
+        body: 'A research compound now available in 10g powder format. This email was sent to you as HTML-only. To view it, please visit a link.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-booking-security',
+        from: 'Booking.com <noreply@booking.com>',
+        subject: 'Important Booking.com Security Update',
+        snippet: 'Security update from Booking.com.',
+        body: 'Security update from Booking.com.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-stripe-receipt',
+        from: 'X <invoice+statements@stripe.com>',
+        subject: 'Your receipt from X #2714-9673-5355',
+        snippet: 'Your receipt from X #2714-9673-5355.',
+        body: 'Your receipt from X #2714-9673-5355.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-experian-score',
+        from: 'Experian Alerts <support@s.usa.experian.com>',
+        subject: 'Your FICO® Score changed',
+        snippet: 'See where your Experian credit file stands. Header logo. Unread notifications. Sign in.',
+        body: 'See where your Experian credit file stands. Header logo. Unread notifications. Sign in.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-moonpay-progress',
+        from: 'MoonPay App <no-reply@moonpay.com>',
+        subject: 'Your order is in progress',
+        snippet: 'Your order is in progress.',
+        body: 'Your order is in progress.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-merch-royalty',
+        from: 'Merch on Demand <noreply-merch-on-demand@amazon.com>',
+        subject: 'Merch on Demand Update to Royalty Terms',
+        snippet: 'Thank you for being a Merch on Demand content creator. Update to Royalty Terms.',
+        body: 'Merch on Demand Update to Royalty Terms. Hello, Thank you for being a Merch on Demand content creator. With our introduction of royalty incentive groups, your performance driving sales with non-organic traffic may change.',
+        expectEmpty: true,
+      },
+      {
+        id: 'eval-marlene-meeting',
+        from: 'Christopher Winig <chris.winig@gmail.com>',
+        subject: 'Re: Looking to clarify services/rates',
+        snippet: 'I’ll talk to Marlene tomorrow about scheduling a meeting with all of us.',
+        body: 'Hey Melissa, I’ll talk to Marlene tomorrow about scheduling a meeting with all of us. It was held up because the Instagram/Facebook access was broken, but pretty sure that’s fixed now.',
+        expectEmpty: false,
+        expectIncludes: ['scheduling a meeting with all of us'],
+      },
+      {
+        id: 'eval-x-phone',
+        from: 'X <notify@x.com>',
+        subject: 'Your phone number has been added to another account',
+        snippet: 'If not, please update your account (@ChrisWinig) with your current phone number.',
+        body: 'Hi Beachboy007. Your phone number has been added to another account. Is this still your phone number? If not, please update your account (@ChrisWinig) with your current phone number.',
+        expectEmpty: false,
+        expectIncludes: ['please update your account'],
+      },
+      {
+        id: 'eval-meta-verification',
+        from: 'Meta for Business <noreply@business-marketing.facebook.com>',
+        subject: 'Continue business verification',
+        snippet: 'Finish verifying your business. You started the business verification process, but did not finish.',
+        body: 'Finish verifying your business. You started the business verification process, but did not finish. Verifying your business allows you to access more Meta products. Resume verification.',
+        expectEmpty: false,
+        expectIncludes: ['finish verifying your business'],
+      },
+    ].map((item, index) => ({
+      ...item,
+      date: `2026-04-15T0${Math.min(index, 9)}:00:00Z`,
+    }));
+
+    for (const testCase of cases) {
+      const actionItems = extractActionItems(testCase);
+      if (testCase.expectEmpty) {
+        expect(actionItems, testCase.id).toEqual([]);
+      } else {
+        expect(actionItems.length, testCase.id).toBeGreaterThan(0);
+        for (const needle of testCase.expectIncludes || []) {
+          expect(actionItems.some((item: string) => item.toLowerCase().includes(needle.toLowerCase())), `${testCase.id}: ${needle}`).toBe(true);
+        }
+      }
+    }
   });
 });
