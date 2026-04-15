@@ -727,20 +727,28 @@ function scoreEntityMatch(candidateName, candidateAliases, page) {
   const candidateNorm = normalizeEntityName(candidateName).toLowerCase();
   const pageTitle = normalizeEntityName(page.title).toLowerCase();
 
+  // Email alias match — strongest identity signal for sender reconciliation.
+  // Use this before title/slug checks so a canonical page keyed by email wins
+  // over duplicate self-pages with a slightly "better" display-name title.
+  // But do not trust personal-email aliases on company pages — they are often
+  // contamination from historical junk merges and create false cross-type hits.
+  const pageAliasesLower = page.aliases.map(a => normalizeEntityName(a).toLowerCase());
+  const pageIsCompany = /\/companies\//.test(String(page.path || ''));
+  for (const ca of candidateAliases || []) {
+    const caNorm = String(ca || '').trim().toLowerCase();
+    if (!caNorm || !caNorm.includes('@')) continue;
+    if (!pageAliasesLower.includes(caNorm)) continue;
+    if (pageIsCompany && PERSONAL_EMAIL_DOMAINS.has(senderEmailParts(caNorm).domain)) continue;
+    return 1.05;
+  }
+
   // Exact title match
   if (candidateNorm && pageTitle && candidateNorm === pageTitle) return 1.0;
 
   // Exact alias match
-  const pageAliasesLower = page.aliases.map(a => normalizeEntityName(a).toLowerCase());
   if (candidateNorm && pageAliasesLower.includes(candidateNorm)) {
     if (isWeakAlias(candidateNorm)) return 0.1; // weak alias match — too risky to trust
     return 0.8;
-  }
-
-  // Email alias match — check if any candidate alias (email) matches a page alias exactly
-  for (const ca of candidateAliases || []) {
-    const caNorm = String(ca || '').trim().toLowerCase();
-    if (caNorm && caNorm.includes('@') && pageAliasesLower.includes(caNorm)) return 0.95;
   }
 
   // Slug match
@@ -967,10 +975,53 @@ function loadEntityCatalog(brainDir) {
   })));
 }
 
+function stripQuotedEmailContext(text) {
+  let value = String(text || '')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&amp;/gi, '&')
+    .replace(/\r/g, '\n');
+  if (!value.trim()) return '';
+
+  const cutPatterns = [
+    /\bOn\s+[A-Z][a-z]{2},?\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}.*?wrote:/i,
+    /\bOn\s+[A-Z][a-z]{2},?\s+\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4}.*?wrote:/i,
+    /-{2,}\s*Forwarded message\s*-{2,}/i,
+    /^>+/m,
+  ];
+
+  let cutoff = value.length;
+  for (const pattern of cutPatterns) {
+    const match = value.match(pattern);
+    if (match && typeof match.index === 'number') {
+      cutoff = Math.min(cutoff, match.index);
+    }
+  }
+  value = value.slice(0, cutoff);
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function trimSnippetPrefix(subject, snippet) {
+  const subjectNorm = normalizeEntityName(subject);
+  let snippetNorm = normalizeEntityName(snippet);
+  if (!subjectNorm || !snippetNorm) return snippetNorm;
+  if (snippetNorm.toLowerCase().startsWith(subjectNorm.toLowerCase())) {
+    snippetNorm = snippetNorm.slice(subjectNorm.length).replace(/^[\s:;,.!?-]+/, '').trim();
+  }
+  return snippetNorm;
+}
+
+function extractMentionScopeText(message) {
+  const subject = stripQuotedEmailContext(message.subject || '');
+  const rawSnippet = message.snippet || message.body || '';
+  const cleanedSnippet = trimSnippetPrefix(subject, stripQuotedEmailContext(rawSnippet));
+  return [subject, cleanedSnippet.slice(0, 500)].filter(Boolean).join('\n');
+}
+
 function detectMentionedEntities(message, brainDir, sender) {
   // Limit catalog matching to same scope as new-entity extraction (subject + first 500 chars)
   // to prevent self-reinforcing junk entities from matching in footers/boilerplate
-  const text = [message.subject, (message.snippet || '').slice(0, 500)].filter(Boolean).join('\n');
+  const text = extractMentionScopeText(message);
   const catalog = loadEntityCatalog(brainDir);
   const matches = new Map();
   const senderNames = new Set([sender.displayName, sender.email].filter(Boolean).map(value => normalizeEntityName(value).toLowerCase()));
@@ -997,7 +1048,7 @@ function detectMentionedEntities(message, brainDir, sender) {
     matches.set(`companies:${slugify(candidate)}`, { kind: 'company', dir: 'companies', name: candidate, aliases: [candidate], source: 'mention' });
   }
 
-  const personCuePattern = /\b(?:with|to|cc|include|loop in|introduce|met|meet|spoke with|talked to)\s+([A-Z][a-z''-]+(?:\s+[A-Z][a-z''-]+){1,2})\b/g;
+  const personCuePattern = /\b(?:with|cc|include|loop in|introduce|met|meet|spoke with|talked to)\s+([A-Z][a-z''-]+(?:\s+[A-Z][a-z''-]+){1,2})\b/g;
   for (const match of text.matchAll(personCuePattern)) {
     const candidate = normalizeEntityName(match[1]);
     if (!looksLikePersonName(candidate) || senderNames.has(candidate.toLowerCase())) continue;
@@ -1096,7 +1147,7 @@ function normalizeBulletBlock(text, fallback) {
 
 function isJunkActionItemText(text) {
   const lower = String(text || '').toLowerCase();
-  return /header logo|unread notifications|member sign in|^sign in$|^log in$|^login$|you are receiving this email because|add .*address book|to ensure continued delivery|view (this )?email in your browser|manage preferences|unsubscribe|this email was sent to|just ask u\.?s\.? bank|just ask u\.?s\.?$|your payment is complete|log in your|order has been shipped|copyright/i.test(lower);
+  return /header logo|unread notifications|member sign in|^sign in$|^log in$|^login$|you are receiving this email because|add .*address book|to ensure continued delivery|view (this )?email in your browser|manage preferences|unsubscribe|this email was sent to|just ask u\.?s\.? bank|just ask u\.?s\.?$|your payment is complete|log in your|order has been shipped|copyright|thank you for being a .*content creator|update to royalty terms/i.test(lower);
 }
 
 function mergeBulletBlocks(existingText, generatedLines) {
