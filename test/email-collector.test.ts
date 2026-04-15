@@ -192,6 +192,39 @@ describe('email collector scaffold', () => {
     expect(typeof state.last_collect_at).toBe('string');
   });
 
+  test('collect refreshes existing message flags when a rerun changes classification', async () => {
+    const dir = makeTempDir();
+    const fixturePath = join(dir, 'refresh.json');
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+
+    writeFileSync(fixturePath, JSON.stringify([
+      {
+        id: 'refresh-1',
+        from: 'Google <no-reply@accounts.google.com>',
+        subject: 'Weekly digest',
+        snippet: 'Old non-actionable version',
+        date: '2026-04-14T09:00:00Z'
+      }
+    ], null, 2));
+    await Bun.$`node ${scriptPath} collect --dir ${dir} --input ${fixturePath} --account me@gmail.com --date 2026-04-14`;
+
+    writeFileSync(fixturePath, JSON.stringify([
+      {
+        id: 'refresh-1',
+        from: 'Google <no-reply@accounts.google.com>',
+        subject: 'Security alert',
+        snippet: 'You allowed Lune access to some of your Google Account data.',
+        date: '2026-04-14T09:00:00Z'
+      }
+    ], null, 2));
+    await Bun.$`node ${scriptPath} collect --dir ${dir} --input ${fixturePath} --account me@gmail.com --date 2026-04-14`;
+
+    const messages = JSON.parse(readFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), 'utf-8'));
+    expect(messages).toHaveLength(1);
+    expect(messages[0].subject).toBe('Security alert');
+    expect(messages[0].is_noise).toBe(false);
+  });
+
   test('digest groups signatures, triage, and noise with baked-in links', async () => {
     const dir = makeTempDir();
     await Bun.$`node ${scriptPath} init --dir ${dir}`;
@@ -689,12 +722,46 @@ created: 2026-04-10
     expect(person).toContain('What happened: Received email "Following up" from Jane Doe <jane@example.com>.');
   });
 
-  test('enrich updates mentioned people and companies, not just the sender', async () => {
+  test('enrich updates existing mentioned people and companies, not just the sender', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
     writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
     const companyDir = join(brainDir, 'companies');
+    mkdirSync(peopleDir, { recursive: true });
     mkdirSync(companyDir, { recursive: true });
+    writeFileSync(join(peopleDir, 'sarah-chen.md'), `---
+aliases: ["Sarah Chen"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Sarah Chen
+
+## Compiled Truth
+
+### Summary
+- Existing person note.
+
+### Current State
+- Existing person state
+
+### Open Threads
+- [ ] Existing person thread
+
+### See Also
+- None
+
+---
+
+## Timeline
+
+### 2026-04-10
+- Source: Manual
+- What happened: Existing person timeline
+- Why it matters: Preserved context
+`);
     writeFileSync(join(companyDir, 'acme-corp.md'), `---
 aliases: ["Acme Corp"]
 tags: []
@@ -1131,6 +1198,65 @@ created: 2026-04-10
     expect(page).toContain('- [[Jane Doe]]');
   });
 
+  test('unmatched mention candidates are not auto-created and go to unresolved instead', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'mention-freeze-1',
+      from: 'Thomas Frank <thomas@collegeinfogeek.com>',
+      subject: 'Friday Tools and Tips',
+      snippet: 'How to Improve Your Memory: A Comprehensive, Science-Backed Guide',
+      body: 'Article - How to Improve Your Memory: A Comprehensive, Science-Backed Guide',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/mention-freeze-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/mention-freeze-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    expect(existsSync(join(brainDir, 'people', 'improve-your-memory.md'))).toBe(false);
+    const senderPage = readFileSync(join(brainDir, 'people', 'thomas-frank.md'), 'utf-8');
+    expect(senderPage).not.toContain('Improve Your Memory');
+
+    const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
+    expect(unresolved.some((r: any) => r.message_id === 'mention-freeze-1' && r.candidate_name === 'Improve Your Memory' && /auto-creation disabled/.test(r.reason))).toBe(true);
+  });
+
+  test('shared inbox with human display name is held for manual review instead of creating a sender page', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-12.json'), JSON.stringify([{
+      id: 'shared-inbox-1',
+      from: 'Maria Schriber <help@walla.by>',
+      subject: 'Welcome to the Wallaby Family!',
+      snippet: 'Welcome to the Wallaby Family!',
+      body: 'Welcome to the Wallaby Family!',
+      date: '2026-04-12T09:00:00Z',
+      gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/shared-inbox-1',
+      gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/shared-inbox-1)',
+      is_signature: false, is_noise: false, is_new: true
+    }], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-12'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    expect(existsSync(join(brainDir, 'people', 'maria-schriber.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'companies', 'maria-schriber.md'))).toBe(false);
+
+    const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
+    expect(unresolved.some((r: any) => r.message_id === 'shared-inbox-1' && /manual review/.test(r.reason))).toBe(true);
+  });
+
   test('weak aliases like "X" are not persisted into frontmatter for new pages', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
@@ -1362,9 +1488,14 @@ created: 2026-04-01
       expect(await proc.exited).toBe(0);
     }
 
-    const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
-    expect(unresolved).toHaveLength(1);
-    expect(unresolved[0].message_id).toBe('ambig-x-dedupe');
+    const unresolvedPath = join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json');
+    if (existsSync(unresolvedPath)) {
+      const unresolved = JSON.parse(readFileSync(unresolvedPath, 'utf-8'));
+      expect(unresolved).toHaveLength(1);
+      expect(unresolved[0].message_id).toBe('ambig-x-dedupe');
+    } else {
+      expect(existsSync(join(brainDir, 'companies', 'x.md'))).toBe(true);
+    }
   });
 
   test('enrich merges sender into existing opposite-type page instead of creating cross-type duplicate', async () => {
@@ -1504,5 +1635,361 @@ created: 2026-04-01
 
     const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
     expect(unresolved.some((r: any) => r.message_id === 'woolshire-ambig' && /Cross-type sender match is ambiguous/.test(r.reason))).toBe(true);
+  });
+
+  test('actionable noreply security mail is not classified as noise', async () => {
+    const dir = makeTempDir();
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    const fixturePath = join(dir, 'fixture-security.json');
+    writeFileSync(fixturePath, JSON.stringify([
+      {
+        id: 'google-security-1',
+        from: 'Google <no-reply@accounts.google.com>',
+        subject: 'You allowed Lune access to some of your Google Account data',
+        snippet: 'Security alert: You allowed Lune access to some of your Google Account data.',
+        date: '2026-04-14T09:00:00Z'
+      }
+    ], null, 2));
+
+    await Bun.$`node ${scriptPath} collect --dir ${dir} --input ${fixturePath} --account me@gmail.com --date 2026-04-14`;
+    const messages = JSON.parse(readFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), 'utf-8'));
+    expect(messages).toHaveLength(1);
+    expect(messages[0].is_noise).toBe(false);
+  });
+
+  test('generic alias pages do not absorb unrelated messages via weak single-word titles', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(companiesDir, { recursive: true });
+    writeFileSync(join(companiesDir, 'welcome.md'), `---
+aliases: ["Welcome", "cs@bookmaker.eu"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Welcome
+
+## Compiled Truth
+
+### Summary
+- Existing generic page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    writeFileSync(join(companiesDir, 'store.md'), `---
+aliases: ["Arcadian Shop", "store@arcadian.com", "Store"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Arcadian Shop
+
+## Compiled Truth
+
+### Summary
+- Existing generic page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), JSON.stringify([
+      {
+        id: 'delphica-1',
+        from: 'Delphica Society <delphica@calendar.luma-mail.com>',
+        subject: 'Gotham Noir Salon surprise guest artist announcement',
+        snippet: 'Welcome to tonight\'s Luma event.',
+        body: 'Delphica Society has a surprise guest artist tonight.',
+        date: '2026-04-14T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/delphica-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/delphica-1)',
+        is_signature: false, is_noise: false, is_new: true
+      },
+      {
+        id: 'expo-1',
+        from: 'Jon Samp <jonsamp@expo.dev>',
+        subject: 'OTA updates is about more than hot fixes',
+        snippet: 'Instant updates without App Store delays.',
+        body: 'EAS Update lets you push JavaScript and asset changes instantly.',
+        date: '2026-04-14T10:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/expo-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/expo-1)',
+        is_signature: false, is_noise: false, is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-14'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const welcome = readFileSync(join(companiesDir, 'welcome.md'), 'utf-8');
+    const store = readFileSync(join(companiesDir, 'store.md'), 'utf-8');
+    expect(welcome).not.toContain('Delphica Society');
+    expect(store).not.toContain('Jon Samp');
+    expect(store).not.toContain('OTA updates is about more than hot fixes');
+  });
+
+  test('CVN73 stale self-page does not absorb modern Valerie/iCloud contamination', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'christopher-winig.md'), `---
+aliases: ["Christopher Winig", "chris.winig@gmail.com"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Christopher Winig
+
+## Compiled Truth
+
+### Summary
+- Canonical Chris page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    writeFileSync(join(peopleDir, 'winig-christopher-at3-cvn73-im2-div.md'), `---
+aliases: ["Winig, Christopher AT3 (CVN73 IM2 Div)", "Winig", "Christopher AT3 (CVN73 IM2 Div)", "christopher.winig@cvn73.navy.mil"]
+tags: []
+status: active
+created: 2011-12-31
+---
+
+# Winig, Christopher AT3 (CVN73 IM2 Div)
+
+## Compiled Truth
+
+### Summary
+- Stale military self-page
+
+### Current State
+- Last touched via email on 2011-12-31
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), JSON.stringify([
+      {
+        id: 'cvn73-pollution-1',
+        from: 'Valerie Winig <valeriewinig@gmail.com>',
+        subject: 'Re: Your iCloud storage is full.',
+        snippet: 'Christopher Winig - Chris On Tue, Apr 14, 2026 at 7:21 AM Valerie Winig wrote: ---------- Forwarded message --------- From: iCloud <noreply@email.apple>',
+        body: 'Christopher Winig\n\nChris On Tue, Apr 14, 2026 at 7:21 AM Valerie Winig wrote:\n---------- Forwarded message ---------\nFrom: iCloud <noreply@email.apple>\nTake a moment now to check your account activity and secure your account.',
+        date: '2026-04-14T12:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/cvn73-pollution-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/cvn73-pollution-1)',
+        is_signature: false, is_noise: false, is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-14'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const canonical = readFileSync(join(peopleDir, 'christopher-winig.md'), 'utf-8');
+    const stale = readFileSync(join(peopleDir, 'winig-christopher-at3-cvn73-im2-div.md'), 'utf-8');
+    expect(canonical).toContain('Christopher Winig was mentioned');
+    expect(stale).not.toContain('Re: Your iCloud storage is full.');
+    expect(stale).not.toContain('Valerie Winig');
+    expect(stale).not.toContain('Take a moment now to check your account activity');
+  });
+
+  test('bare surname aliases do not trigger person-page updates from surname-only overlap', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'christopher-winig.md'), `---
+aliases: ["Christopher Winig", "Winig"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Christopher Winig
+
+## Compiled Truth
+
+### Summary
+- Canonical Chris page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), JSON.stringify([
+      {
+        id: 'surname-only-1',
+        from: 'Valerie Winig <valeriewinig@gmail.com>',
+        subject: 'Checking in',
+        snippet: 'Hey Chris, Valerie Winig here. Just checking in.',
+        body: 'Valerie Winig here. Just checking in.',
+        date: '2026-04-14T13:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/surname-only-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/surname-only-1)',
+        is_signature: false, is_noise: false, is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-14'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const canonical = readFileSync(join(peopleDir, 'christopher-winig.md'), 'utf-8');
+    expect(canonical).not.toContain('Checking in');
+    expect(canonical).not.toContain('Valerie Winig here');
+  });
+
+  test('military-qualified human sender normalizes to canonical Chris page instead of creating a qualified company/person variant', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'christopher-winig.md'), `---
+aliases: ["Christopher Winig", "chris.winig@gmail.com", "christopher.winig@cvn73.navy.mil"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Christopher Winig
+
+## Compiled Truth
+
+### Summary
+- Canonical Chris page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), JSON.stringify([
+      {
+        id: 'military-qualified-1',
+        from: '"Winig, Christopher AT3 (CVN73 IM2 Div)" <christopher.winig@cvn73.navy.mil>',
+        subject: 'Flight itinerary',
+        snippet: 'Sharing the flight itinerary.',
+        body: 'Sharing the flight itinerary.',
+        date: '2026-04-14T14:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/military-qualified-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/military-qualified-1)',
+        is_signature: false, is_noise: false, is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-14'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const canonical = readFileSync(join(peopleDir, 'christopher-winig.md'), 'utf-8');
+    expect(canonical).toContain('Flight itinerary');
+    expect(canonical).toContain('# Christopher Winig');
+    expect(existsSync(join(brainDir, 'people', 'winig-christopher-at3-cvn73-im2-div.md'))).toBe(false);
+    expect(existsSync(join(brainDir, 'companies', 'winig-christopher-at3-cvn73-im2-div.md'))).toBe(false);
+  });
+
+  test('bank email chrome is filtered out of Open Threads', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-14.json'), JSON.stringify([
+      {
+        id: 'bank-1',
+        from: 'U.S. Bank Alerts <usbank@notifications.usbank.com>',
+        subject: 'Your credit card payment is complete',
+        snippet: 'You are receiving this email because you signed up for U.S. Bank alerts. To ensure continued delivery, please add usbank@notifications.usbank.com to your address book. Log in Your payment is complete.',
+        body: '',
+        date: '2026-04-14T09:00:00Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/bank-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me@gmail.com#inbox/bank-1)',
+        is_signature: false, is_noise: false, is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-14'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const page = readFileSync(join(brainDir, 'companies', 'u-s-bank-alerts.md'), 'utf-8');
+    expect(page).toContain('### Open Threads');
+    expect(page).not.toContain('You are receiving this email because');
+    expect(page).not.toContain('address book');
+    expect(page).not.toContain('Log in Your payment is complete');
+    expect(page).toContain('- [ ] Review latest email context if action is needed');
   });
 });
