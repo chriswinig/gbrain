@@ -1147,7 +1147,7 @@ function normalizeBulletBlock(text, fallback) {
 
 function isJunkActionItemText(text) {
   const lower = String(text || '').toLowerCase();
-  return /header logo|unread notifications|member sign in|^sign in$|^log in$|^login$|you are receiving this email because|add .*address book|to ensure continued delivery|view (this )?email in your browser|manage preferences|unsubscribe|this email was sent to|just ask u\.?s\.? bank|just ask u\.?s\.?$|your payment is complete|log in your|order has been shipped|copyright|thank you for being a .*content creator|update to royalty terms/i.test(lower);
+  return /header logo|unread notifications|member sign in|^sign in$|^log in$|^login$|you are receiving this email because|add .*address book|to ensure continued delivery|view (this )?email in your browser|manage preferences|unsubscribe|this email was sent to|just ask u\.?s\.? bank|just ask u\.?s\.?$|your payment is complete|log in your|order has been shipped|copyright|thank you for being a .*content creator|update to royalty terms|we.?d love your feedback|valued customer|contact us form|for more assistance chat with us|visit the help center|get started|check out the|forwarded message|this email was sent to you as html-only|to view it, please visit|make sure you are part of the action|\bi just checked\b|\bwith square checking\b|\bsee what square checking has to offer\b/i.test(lower);
 }
 
 function mergeBulletBlocks(existingText, generatedLines) {
@@ -1188,9 +1188,13 @@ function addDays(dateStr, days) {
 }
 
 function extractActionItems(message) {
-  const text = [message.body || message.snippet || message.subject].filter(Boolean).join('\n');
+  const subject = stripQuotedEmailContext(message.subject || '');
+  const snippet = trimSnippetPrefix(subject, stripQuotedEmailContext(message.snippet || ''));
+  const body = stripQuotedEmailContext(message.body || '');
+  const text = [subject, snippet, body].filter(Boolean).join('\n');
   if (!text.trim()) return [];
   const cleaned = text
+    .replace(/<[^>]+>/g, ' ')
     .replace(/\r/g, ' ')
     .replace(/\s+/g, ' ')
     .replace(/[•·]+/g, ' ')
@@ -1198,13 +1202,14 @@ function extractActionItems(message) {
   const parts = cleaned.split(/(?<=[.!?])\s+/);
   const items = [];
   const seen = new Set();
+  const actionPattern = /\b(reply|review|confirm|send|finish|resume|continue|call|verify)\b|\bfollow up\b|\bloop in\b|\bschedul(?:e|ing)\b|\bmeet(?:ing)?\b|\bcheck\b(?!\s*out)|\bplease\s+(?:reply|review|confirm|send|update|verify|call|check)\b|\bupdate\s+(?:your|the|this|that)\b/i;
   for (let part of parts) {
     part = part.trim().replace(/[.!?]+$/g, '');
     const lower = part.toLowerCase();
     if (!part) continue;
     if (part.length < 12 || part.length > 180) continue;
     if (isJunkActionItemText(lower)) continue;
-    if (!/(please|reply|review|confirm|send|update|schedule|call|follow up|check|share|sign|complete|continue|verify|ask|include|loop in|meet)/i.test(part)) continue;
+    if (!actionPattern.test(part)) continue;
     let bullet = `- [ ] ${part}`;
     if (/before tomorrow|by tomorrow|tomorrow/.test(lower)) {
       const due = addDays(message.date || new Date().toISOString(), 1);
