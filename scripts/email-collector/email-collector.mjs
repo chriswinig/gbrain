@@ -1,11 +1,37 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { spawnSync } from 'child_process';
 import YAML from 'yaml';
 
 const NOISE_PATTERNS = ['noreply', 'no-reply', 'notifications@', 'calendar-notification', 'mailer-daemon', 'postmaster', 'donotreply'];
+const ACTIONABLE_NOTIFICATION_PATTERNS = [
+  /security/i,
+  /verification/i,
+  /verify/i,
+  /allowed .* access/i,
+  /access to .*account data/i,
+  /phone number has been added to another account/i,
+  /business verification/i,
+  /payment/i,
+  /booking/i,
+  /reservation/i,
+  /parking violation/i,
+  /ticket/i,
+];
+const NOISE_CONTENT_PATTERNS = [
+  /weekly digest/i,
+  /\breceipt\b/i,
+  /\bsale\b/i,
+  /tickets? locked in/i,
+  /newsletter/i,
+  /promo/i,
+  /promotion/i,
+  /your order is in progress/i,
+  /order has been shipped/i,
+  /don.t wait/i,
+];
 const SIGNATURE_PATTERNS = [
   /docusign/i,
   /dropbox sign/i,
@@ -19,10 +45,10 @@ const SIGNATURE_PATTERNS = [
 ];
 const COMPANY_SUFFIXES = new Set(['inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'co', 'labs', 'lab', 'ai', 'ventures', 'capital', 'group', 'studio', 'studios', 'systems', 'technologies', 'technology', 'partners', 'health', 'fitness']);
 const ENTITY_STOPWORDS = new Set(['Need', 'Review', 'Please', 'Thanks', 'Thank', 'Tomorrow', 'Today', 'Team', 'Brain', 'Email', 'Sync', 'This', 'That', 'Message', 'Messages', 'Page', 'Pages', 'Open', 'Threads', 'Executive', 'Summary', 'Last', 'Touched', 'Design', 'Kick', 'Import', 'Real']);
-const GENERIC_SENDER_LOCAL_PARTS = [/noreply/i, /no-reply/i, /notification/i, /support/i, /billing/i, /invoice/i, /statement/i, /receipt/i, /team/i, /info/i, /contact/i, /mail/i, /system/i, /security/i, /account/i, /acct_/i, /hello/i, /jobs/i, /careers/i, /feedback/i];
+const GENERIC_SENDER_LOCAL_PARTS = [/noreply/i, /no-reply/i, /notification/i, /support/i, /help/i, /billing/i, /invoice/i, /statement/i, /receipt/i, /team/i, /info/i, /contact/i, /mail/i, /system/i, /security/i, /account/i, /acct_/i, /hello/i, /jobs/i, /careers/i, /feedback/i, /customer[-_.]?service/i];
 const PERSONAL_EMAIL_DOMAINS = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'icloud.com', 'me.com', 'mac.com', 'yahoo.com', 'proton.me', 'protonmail.com', 'pm.me', 'aol.com']);
-const NOISE_ENTITY_BLOCKLIST = new Set(['notification', 'support', 'us', 'noreply', 'info', 'alerts', 'admin', 'team', 'hello', 'contact', 'help', 'sales', 'billing', 'feedback', 'system', 'security', 'account', 'service', 'mail', 'update', 'updates', 'news', 'newsletter', 'marketing', 'promotions', 'no-reply', 'do-not-reply', 'donotreply']);
-const WEAK_ALIAS_BLOCKLIST = new Set(['x', 'us', 'support', 'notification', 'billing', 'feedback', 'info', 'team', 'admin', 'help', 'sales', 'contact', 'service', 'mail', 'system', 'security', 'account', 'hello', 'news', 'update', 'alerts', 'hr', 'it', 'ops', 'dev', 'qa', 'api', 'app', 'web', 'go', 'do', 'ai', 'io', 'me', 'my', 'to', 'at', 'up', 'no', 'on', 'or', 'so', 'ok']);
+const NOISE_ENTITY_BLOCKLIST = new Set(['notification', 'support', 'us', 'noreply', 'info', 'alerts', 'admin', 'team', 'hello', 'contact', 'help', 'sales', 'billing', 'feedback', 'system', 'security', 'account', 'service', 'mail', 'update', 'updates', 'news', 'newsletter', 'marketing', 'promotions', 'no-reply', 'do-not-reply', 'donotreply', 'welcome', 'store', 'confirmation', 'status', 'tracking', 'orders']);
+const WEAK_ALIAS_BLOCKLIST = new Set(['x', 'us', 'support', 'notification', 'billing', 'feedback', 'info', 'team', 'admin', 'help', 'sales', 'contact', 'service', 'mail', 'system', 'security', 'account', 'hello', 'news', 'update', 'alerts', 'hr', 'it', 'ops', 'dev', 'qa', 'api', 'app', 'web', 'go', 'do', 'ai', 'io', 'me', 'my', 'to', 'at', 'up', 'no', 'on', 'or', 'so', 'ok', 'welcome', 'store', 'confirmation', 'status', 'tracking', 'orders']);
 const MATCH_THRESHOLD = 0.3;
 const SENDER_MERGE_THRESHOLD = 0.3;
 const MENTION_MERGE_THRESHOLD = 0.5;
@@ -125,7 +151,10 @@ function gmailLink(messageId, authuser) {
 
 function isNoise(message) {
   const from = String(message.from || '').toLowerCase();
-  return NOISE_PATTERNS.some(pattern => from.includes(pattern));
+  if (!NOISE_PATTERNS.some(pattern => from.includes(pattern))) return false;
+  const text = [message.subject, message.snippet, message.body, message.from].filter(Boolean).join('\n');
+  if (ACTIONABLE_NOTIFICATION_PATTERNS.some(pattern => pattern.test(text))) return false;
+  return NOISE_CONTENT_PATTERNS.some(pattern => pattern.test(text));
 }
 
 function isSignature(message) {
@@ -260,11 +289,19 @@ function collect(baseDir, inputPath, account, dateArg, provider, gwsBin) {
 
   for (const raw of rawMessages) {
     const normalized = normalizeMessage(raw, account, state.known_message_ids || {});
-    if (existingById.has(normalized.id)) continue;
-    existingById.set(normalized.id, normalized);
+    const existingRecord = existingById.get(normalized.id);
+    if (existingRecord) {
+      const merged = { ...existingRecord, ...normalized, is_new: existingRecord.is_new ?? normalized.is_new };
+      if (JSON.stringify(existingRecord) !== JSON.stringify(merged)) {
+        existingById.set(normalized.id, merged);
+        changed = true;
+      }
+    } else {
+      existingById.set(normalized.id, normalized);
+      changed = true;
+    }
     state.known_message_ids[normalized.id] = true;
     if (normalized.is_signature) state.pending_signatures[normalized.id] = true;
-    changed = true;
   }
 
   state.last_collect_at = new Date().toISOString();
@@ -295,9 +332,9 @@ function digest(baseDir, dateArg) {
   const date = normalizeDate(dateArg || latestCollectedDate(baseDir));
   const records = readJson(messagesPath(baseDir, date), []);
 
-  const signatures = records.filter(msg => msg.is_signature);
-  const triage = records.filter(msg => !msg.is_signature && !msg.is_noise);
-  const noise = records.filter(msg => msg.is_noise);
+  const signatures = records.filter(msg => isSignature(msg));
+  const triage = records.filter(msg => !isSignature(msg) && !isNoise(msg));
+  const noise = records.filter(msg => isNoise(msg));
 
   const lines = [
     `# Email Digest — ${date}`,
@@ -319,6 +356,71 @@ function stripWrappingQuotes(text) {
   return value;
 }
 
+const HUMAN_QUALIFIER_WORDS = new Set([
+  'civ', 'ctr', 'div', 'divo', 'mao', 'boss', 'medical', 'dept', 'department',
+  'office', 'team', 'division', 'squadron', 'command', 'det', 'detachment',
+  'lt', 'ens', 'lcdr', 'cdr', 'capt', 'cmdr', 'adc', 'hm', 'at', 'ao', 'ps',
+  'po', 'sn', 'fn', 'an', 'ae', 'ad', 'it', 'ct',
+]);
+
+function titleCaseHumanToken(token) {
+  const value = String(token || '');
+  if (!value) return '';
+  return value[0].toUpperCase() + value.slice(1).toLowerCase();
+}
+
+function isHumanQualifierToken(token) {
+  const clean = String(token || '')
+    .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9.]+$/g, '')
+    .replace(/\.+$/g, '');
+  if (!clean) return false;
+  const lower = clean.toLowerCase();
+  if (HUMAN_QUALIFIER_WORDS.has(lower)) return true;
+  if (/^cvn\d+$/i.test(clean)) return true;
+  if (/^[A-Z]{2,5}\d{0,2}$/.test(clean) && clean === clean.toUpperCase()) return true;
+  return false;
+}
+
+function looksLikeCanonicalHumanName(name) {
+  const normalized = normalizeEntityName(name).replace(/[.,]+$/g, '');
+  const tokens = normalized.split(' ').filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 3) return false;
+  if (tokens.some(token => token.includes('@') || isHumanQualifierToken(token))) return false;
+  if (isStopwordEntity(normalized) || looksLikeCompanyName(normalized)) return false;
+  return tokens.every(token => /^[A-Z][a-z''’-]+$/.test(token) || /^[A-Z]$/.test(token));
+}
+
+function normalizeCanonicalHumanName(raw) {
+  let value = stripWrappingQuotes(String(raw || '')).trim();
+  if (!value) return '';
+  value = value.replace(/\([^)]*\)/g, ' ');
+  if (looksLikeCompanyName(value.replace(/\s+/g, ' ').trim())) return '';
+  const commaMatch = value.match(/^([^,]+),\s*(.+)$/);
+  if (commaMatch) {
+    value = `${commaMatch[2]} ${commaMatch[1]}`;
+  }
+  const tokens = value
+    .split(/\s+/)
+    .map(token => token.replace(/^[^A-Za-z]+|[^A-Za-z.']+$/g, ''))
+    .filter(Boolean);
+  const filtered = [];
+  for (const token of tokens) {
+    const bare = token.replace(/\.+$/g, '');
+    if (!bare || /^\d+$/.test(bare) || isHumanQualifierToken(bare)) continue;
+    filtered.push(bare);
+  }
+  if (filtered.length < 2) return '';
+  const canonicalTokens = [];
+  for (const token of filtered) {
+    if (/^[A-Z]$/.test(token) && filtered.length > 2) continue;
+    if (!/^[A-Za-z][A-Za-z''’-]*$/.test(token)) return '';
+    canonicalTokens.push(titleCaseHumanToken(token));
+  }
+  if (canonicalTokens.length < 2 || canonicalTokens.length > 3) return '';
+  const candidate = canonicalTokens.join(' ');
+  return looksLikeCanonicalHumanName(candidate) ? candidate : '';
+}
+
 function sanitizeSenderDisplayName(raw) {
   let name = String(raw || '').trim();
   name = stripWrappingQuotes(name);
@@ -328,22 +430,26 @@ function sanitizeSenderDisplayName(raw) {
     const best = parts.find(p => !/^\d{4}$/.test(p) && p.length > 1) || parts[parts.length - 1];
     name = best;
   }
-  // Strip leading/trailing punctuation
-  name = name.replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, '');
+  // Strip only wrapping quotes/whitespace, not meaningful human qualifiers in parens.
+  name = name.replace(/^[\s"'`]+|[\s"'`]+$/g, '');
   return name.trim() || 'Unknown Sender';
 }
 
 function parseSender(fromHeader) {
   const match = String(fromHeader || '').match(/^(.*?)\s*<([^>]+)>$/);
   if (match) {
-    return { displayName: sanitizeSenderDisplayName(match[1]), email: match[2].trim().toLowerCase() };
+    const email = match[2].trim().toLowerCase();
+    const displayName = sanitizeSenderDisplayName(match[1]);
+    return { displayName: normalizeCanonicalHumanName(displayName) || displayName, email };
   }
   const value = String(fromHeader || '').trim();
   if (value.includes('@')) {
     const name = value.split('@')[0].replace(/[._-]+/g, ' ').trim();
-    return { displayName: name.split(/\s+/).map(part => part ? part[0].toUpperCase() + part.slice(1) : '').join(' '), email: value.toLowerCase() };
+    const displayName = name.split(/\s+/).map(part => part ? part[0].toUpperCase() + part.slice(1) : '').join(' ');
+    return { displayName: normalizeCanonicalHumanName(displayName) || displayName, email: value.toLowerCase() };
   }
-  return { displayName: sanitizeSenderDisplayName(value), email: '' };
+  const displayName = sanitizeSenderDisplayName(value);
+  return { displayName: normalizeCanonicalHumanName(displayName) || displayName, email: '' };
 }
 
 function senderEmailParts(email) {
@@ -369,12 +475,13 @@ function classifySenderEntityKind(sender) {
   const hasGenericLocal = GENERIC_SENDER_LOCAL_PARTS.some(pattern => pattern.test(local));
   const domainMatchesDisplay = Boolean(displayKey && domainKey && domainKey === displayKey);
   const localMatchesDisplay = Boolean(displayKey && localKey && localKey === displayKey);
-  const companySignals = hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName);
+  const displayNameLooksPerson = looksLikePersonName(displayName);
+  const displayNameHasServiceCue = /\b(alert|alerts|support|help|billing|invoice|bank|rewards|notification|team|service|services|department|office|advising|admissions|registrar|association|university|college|school|federal|clinic|pharmacy)\b/i.test(displayName);
+  const companySignals = hasGenericLocal || domainMatchesDisplay || looksLikeCompanyName(displayName) || displayNameHasServiceCue;
 
-  if (isPersonalDomain && looksLikePersonName(displayName)) return 'person';
+  if (isPersonalDomain && displayNameLooksPerson) return 'person';
   if (companySignals) return 'company';
-  if (looksLikePersonName(displayName)) return 'person';
-  if (displayName.includes(' ')) return 'person';
+  if (displayNameLooksPerson) return 'person';
   if (isPersonalDomain && localMatchesDisplay) return 'person';
   if (localMatchesDisplay && !hasGenericLocal) return 'person';
   return sender.email ? 'company' : 'person';
@@ -512,10 +619,9 @@ function looksLikeCompanyName(name) {
 
 function looksLikePersonName(name) {
   const normalized = normalizeEntityName(name).replace(/[.,]+$/g, '');
-  const tokens = normalized.split(' ');
-  if (tokens.length < 2 || tokens.length > 3) return false;
-  if (isStopwordEntity(normalized) || looksLikeCompanyName(normalized)) return false;
-  return tokens.every(token => /^[A-Z][a-z''-]+$/.test(token));
+  if (looksLikeCanonicalHumanName(normalized)) return true;
+  const canonical = normalizeCanonicalHumanName(normalized);
+  return Boolean(canonical && looksLikeCanonicalHumanName(canonical));
 }
 
 function containsEntityMention(text, alias) {
@@ -570,12 +676,51 @@ function isWeakAlias(alias) {
   return false;
 }
 
+function isSafePersonMentionAlias(alias) {
+  const normalized = normalizeEntityName(alias).replace(/[.,]+$/g, '');
+  if (!normalized || normalized.includes('@')) return false;
+  if (normalized.split(' ').length < 2) return false;
+  if (normalized.split(' ').some(token => isHumanQualifierToken(token))) return false;
+  return looksLikeCanonicalHumanName(normalized) || looksLikeCompanyName(normalized);
+}
+
+function getMentionableAliases(entity) {
+  const aliases = entity.aliases || [];
+  if (entity.kind === 'person') {
+    return aliases.filter(alias => !isWeakAlias(alias) && isSafePersonMentionAlias(alias));
+  }
+  return aliases.filter(alias => !isWeakAlias(alias));
+}
+
+function choosePreferredEntityName(dirName, incomingName, existingTitle = '') {
+  const incoming = normalizeEntityName(incomingName);
+  const existing = normalizeEntityName(existingTitle);
+  if (dirName !== 'people') return incoming || existing;
+  const existingCanonical = normalizeCanonicalHumanName(existing);
+  const incomingCanonical = normalizeCanonicalHumanName(incoming);
+  if (existingCanonical) return existingCanonical;
+  if (incomingCanonical) return incomingCanonical;
+  return incoming || existing;
+}
+
 function isViableSenderEntity(name) {
   const normalized = normalizeEntityName(name);
   if (!normalized) return false;
   if (NOISE_ENTITY_BLOCKLIST.has(normalized.toLowerCase())) return false;
   if (normalized.length <= 1 && !/[A-Z]/.test(normalized)) return false;
   return true;
+}
+
+function senderNeedsManualReview(entityName, aliases, dirName) {
+  if (dirName !== 'companies') return false;
+  const emailAlias = (aliases || []).find(alias => String(alias || '').includes('@'));
+  if (!emailAlias) return false;
+  const { local, domain } = senderEmailParts(emailAlias);
+  if (!local || PERSONAL_EMAIL_DOMAINS.has(domain)) return false;
+  const hasGenericLocal = GENERIC_SENDER_LOCAL_PARTS.some(pattern => pattern.test(local));
+  const hasServiceCue = /\b(alert|alerts|support|help|billing|invoice|bank|rewards|notification|team|service|services|department|office|advising|admissions|registrar|association|university|college|school|federal|clinic|pharmacy)\b/i.test(entityName);
+  if (hasServiceCue || looksLikeCompanyName(entityName)) return false;
+  return hasGenericLocal && looksLikePersonName(entityName);
 }
 
 function scoreEntityMatch(candidateName, candidateAliases, page) {
@@ -712,6 +857,11 @@ function writeUnresolvedCandidate(baseDir, record) {
   atomicWrite(reportPath, JSON.stringify(deduped, null, 2));
 }
 
+function clearUnresolvedReport(baseDir, date) {
+  const reportPath = join(resolve(baseDir), 'data', 'reports', 'unresolved-entities', `${date}.json`);
+  if (existsSync(reportPath)) rmSync(reportPath);
+}
+
 function readResolver(brainDir) {
   const resolverPath = join(resolve(brainDir), 'RESOLVER.md');
   if (!existsSync(resolverPath)) {
@@ -827,7 +977,8 @@ function detectMentionedEntities(message, brainDir, sender) {
 
   for (const entity of catalog) {
     if (entity.aliases.some(alias => senderNames.has(alias.toLowerCase()))) continue;
-    if (entity.aliases.some(alias => containsEntityMention(text, alias))) {
+    const strongAliases = getMentionableAliases(entity);
+    if (strongAliases.some(alias => containsEntityMention(text, alias))) {
       matches.set(`${entity.dir}:${entity.slug}`, {
         kind: entity.kind,
         dir: entity.dir,
@@ -943,9 +1094,14 @@ function normalizeBulletBlock(text, fallback) {
   return value || fallback;
 }
 
+function isJunkActionItemText(text) {
+  const lower = String(text || '').toLowerCase();
+  return /header logo|unread notifications|member sign in|^sign in$|^log in$|^login$|you are receiving this email because|add .*address book|to ensure continued delivery|view (this )?email in your browser|manage preferences|unsubscribe|this email was sent to|just ask u\.?s\.? bank|just ask u\.?s\.?$|your payment is complete|log in your|order has been shipped|copyright/i.test(lower);
+}
+
 function mergeBulletBlocks(existingText, generatedLines) {
-  const existingLines = String(existingText || '').split('\n').map(line => line.trim()).filter(Boolean);
-  const generated = generatedLines.map(line => String(line || '').trim()).filter(Boolean);
+  const existingLines = String(existingText || '').split('\n').map(line => line.trim()).filter(Boolean).filter(line => !isJunkActionItemText(line));
+  const generated = generatedLines.map(line => String(line || '').trim()).filter(Boolean).filter(line => !isJunkActionItemText(line));
   const seen = new Set();
   const merged = [];
   for (const line of existingLines.concat(generated)) {
@@ -981,7 +1137,7 @@ function addDays(dateStr, days) {
 }
 
 function extractActionItems(message) {
-  const text = [message.body, message.snippet, message.subject].filter(Boolean).join('\n');
+  const text = [message.body || message.snippet || message.subject].filter(Boolean).join('\n');
   if (!text.trim()) return [];
   const cleaned = text
     .replace(/\r/g, ' ')
@@ -996,7 +1152,7 @@ function extractActionItems(message) {
     const lower = part.toLowerCase();
     if (!part) continue;
     if (part.length < 12 || part.length > 180) continue;
-    if (/header logo|unread notifications|member sign in|^sign in$|^log in$|^login$/.test(lower)) continue;
+    if (isJunkActionItemText(lower)) continue;
     if (!/(please|reply|review|confirm|send|update|schedule|call|follow up|check|share|sign|complete|continue|verify|ask|include|loop in|meet)/i.test(part)) continue;
     let bullet = `- [ ] ${part}`;
     if (/before tomorrow|by tomorrow|tomorrow/.test(lower)) {
@@ -1084,18 +1240,6 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
   ensureDir(entityDir);
   ensureDir(rawDir);
 
-  if (collectorBaseDir && mode === 'sender' && isWeakAlias(entityName)) {
-    writeUnresolvedCandidate(collectorBaseDir, {
-      message_id: message.id,
-      date,
-      kind: 'sender',
-      candidate_name: entityName,
-      candidate_aliases: aliases,
-      source: mode,
-      reason: 'Weak sender alias requires manual review',
-      top_matches: [],
-    });
-  }
 
   // Task 1+6: Use scored matching instead of first-match-wins
   const allCandidates = [entityName, ...aliases].filter(Boolean);
@@ -1135,6 +1279,22 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
   }
 
   const existing = existingMatch?.page || null;
+
+  if (mode === 'sender' && !existing && senderNeedsManualReview(entityName, aliases, currentDirName)) {
+    if (collectorBaseDir) {
+      writeUnresolvedCandidate(collectorBaseDir, {
+        message_id: message.id,
+        date,
+        kind: 'sender',
+        candidate_name: entityName,
+        candidate_aliases: aliases,
+        source: mode,
+        reason: 'Generic shared inbox with human display name requires manual review',
+        top_matches: [],
+      });
+    }
+    return null;
+  }
 
   // Task 6: Score-based merge guard with secondary token overlap check
   if (existing) {
@@ -1182,17 +1342,18 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
       const entityPath = join(entityDir, `${slug}.md`);
       const rawPath = join(rawDir, `${slug}.json`);
       const page = splitPage(existing.content);
+      const preferredEntityName = choosePreferredEntityName(currentDirName, entityName, existing.title);
       // Task 5: Sanitize aliases before persisting
-      const mergedAliases = sanitizeAliases(Array.from(new Set([entityName]
+      const mergedAliases = sanitizeAliases(Array.from(new Set([preferredEntityName]
         .concat(aliases)
         .concat([extractTitle(existing.content)])
         .concat(parseAliases(existing.content))
         .filter(Boolean)
         .map(normalizeEntityName))));
-      const compiled = buildTemplateCompiledContent(entityName, page.compiled, relatedNames, date, message);
+      const compiled = buildTemplateCompiledContent(preferredEntityName, page.compiled, relatedNames, date, message);
       const timeline = mode === 'sender'
-        ? appendTimelineEntry(page.timeline, entityName, message)
-        : appendMentionTimelineEntry(page.timeline, entityName, message);
+        ? appendTimelineEntry(page.timeline, preferredEntityName, message)
+        : appendMentionTimelineEntry(page.timeline, preferredEntityName, message);
       const frontmatter = buildManagedFrontmatter(page.frontmatter || {}, mergedAliases, date);
       atomicWrite(entityPath, `${serializeFrontmatter(frontmatter)}\n\n${compiled}\n\n---\n\n${timeline}\n`);
 
@@ -1201,27 +1362,39 @@ function upsertEntityPage(brainDir, dirName, entityName, aliases, relatedNames, 
         raw.messages.push(message);
       }
       atomicWrite(rawPath, JSON.stringify(raw, null, 2));
-      return { slug, path: entityPath, title: entityName, dir: currentDirName };
+      return { slug, path: entityPath, title: preferredEntityName, dir: currentDirName };
     }
   }
 
-  // Task 2: For mentions without an existing page match, require higher confidence to create
+  // Mention auto-creation is disabled for stability.
+  // Only existing entities should be updated from email mention extraction.
   if (mode === 'mention' && !existing) {
-    // Only create mention pages for catalog matches or strong regex evidence
-    // Catalog matches come with pre-existing pages, so if we're here it's a regex-only candidate
-    // Check if we have enough evidence to create
-    const candidateTokens = significantTokens(entityName);
-    if (candidateTokens.length === 0) {
-      if (collectorBaseDir) {
-        writeUnresolvedCandidate(collectorBaseDir, {
-          message_id: message.id, date, kind: 'mention', candidate_name: entityName,
-          candidate_aliases: aliases, source: mode,
-          reason: 'Mention candidate has zero significant tokens — skipped creation',
-          top_matches: [],
-        });
-      }
-      return null;
+    if (collectorBaseDir) {
+      writeUnresolvedCandidate(collectorBaseDir, {
+        message_id: message.id,
+        date,
+        kind: 'mention',
+        candidate_name: entityName,
+        candidate_aliases: aliases,
+        source: mode,
+        reason: 'Mention candidate requires existing entity match; auto-creation disabled',
+        top_matches: [],
+      });
     }
+    return null;
+  }
+
+  if (collectorBaseDir && mode === 'sender' && isWeakAlias(entityName) && !existing) {
+    writeUnresolvedCandidate(collectorBaseDir, {
+      message_id: message.id,
+      date,
+      kind: 'sender',
+      candidate_name: entityName,
+      candidate_aliases: aliases,
+      source: mode,
+      reason: 'Weak sender alias requires manual review',
+      top_matches: [],
+    });
   }
 
   // Create new page
@@ -1287,11 +1460,12 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
 
   const date = normalizeDate(dateArg || latestCollectedDate(baseDir));
   const records = readJson(messagesPath(baseDir, date), []);
+  clearUnresolvedReport(baseDir, date);
 
   let updated = 0;
   const updatedPages = [];
-  for (const message of records.filter(msg => !msg.is_noise)) {
-    const enrichedMessage = { ...message, action_items: extractActionItems(message) };
+  for (const message of records.filter(msg => !isNoise(msg))) {
+    const enrichedMessage = { ...message, is_noise: isNoise(message), is_signature: isSignature(message), action_items: extractActionItems(message) };
     const sender = parseSender(enrichedMessage.from);
     const senderKind = classifySenderEntityKind(sender);
     const senderDir = resolveEntityDir(brainDir, senderKind);
@@ -1302,7 +1476,35 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
       continue;
     }
 
-    const mentions = detectMentionedEntities(enrichedMessage, brainDir, sender).filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
+    const mentionCandidates = detectMentionedEntities(enrichedMessage, brainDir, sender)
+      .filter(entity => normalizeEntityName(entity.name).toLowerCase() !== normalizeEntityName(sender.displayName).toLowerCase());
+    const mentions = [];
+    for (const entity of mentionCandidates) {
+      const entityKind = entity.kind || (entity.dir === 'people' ? 'person' : 'company');
+      const resolvedDir = resolveEntityDir(brainDir, entityKind);
+      validateEntityAgainstLocalResolver(brainDir, resolvedDir, entityKind);
+      const aliases = entity.aliases || [entity.name];
+      const existingMatch = findBestEntityPageWithScore(join(resolve(brainDir), resolvedDir), [entity.name, ...aliases], aliases);
+      if (!existingMatch) {
+        writeUnresolvedCandidate(baseDir, {
+          message_id: enrichedMessage.id,
+          date,
+          kind: 'mention',
+          candidate_name: entity.name,
+          candidate_aliases: aliases,
+          source: 'mention',
+          reason: 'Mention candidate requires existing entity match; auto-creation disabled',
+          top_matches: [],
+        });
+        continue;
+      }
+      mentions.push({
+        name: entity.name,
+        aliases,
+        dir: resolvedDir,
+        mode: 'mention',
+      });
+    }
     const entitiesForMessage = [
       {
         name: sender.displayName,
@@ -1310,17 +1512,7 @@ function enrich(baseDir, brainDir, dateArg, syncAfterEnrich, gbrainBin, embedSta
         dir: senderDir,
         mode: 'sender',
       },
-      ...mentions.map(entity => {
-        const entityKind = entity.kind || (entity.dir === 'people' ? 'person' : 'company');
-        const resolvedDir = resolveEntityDir(brainDir, entityKind);
-        validateEntityAgainstLocalResolver(brainDir, resolvedDir, entityKind);
-        return {
-          name: entity.name,
-          aliases: entity.aliases || [entity.name],
-          dir: resolvedDir,
-          mode: 'mention',
-        };
-      }),
+      ...mentions,
     ];
 
     for (const entity of entitiesForMessage) {
