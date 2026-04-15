@@ -1198,7 +1198,7 @@ created: 2026-04-10
     expect(page).toContain('- [[Jane Doe]]');
   });
 
-  test('unmatched mention candidates are not auto-created and go to unresolved instead', async () => {
+  test('article-title snippets do not emit junk unresolved mention candidates', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
     writeResolver(brainDir);
@@ -1224,8 +1224,13 @@ created: 2026-04-10
     const senderPage = readFileSync(join(brainDir, 'people', 'thomas-frank.md'), 'utf-8');
     expect(senderPage).not.toContain('Improve Your Memory');
 
-    const unresolved = JSON.parse(readFileSync(join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json'), 'utf-8'));
-    expect(unresolved.some((r: any) => r.message_id === 'mention-freeze-1' && r.candidate_name === 'Improve Your Memory' && /auto-creation disabled/.test(r.reason))).toBe(true);
+    const unresolvedPath = join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-12.json');
+    if (existsSync(unresolvedPath)) {
+      const unresolved = JSON.parse(readFileSync(unresolvedPath, 'utf-8'));
+      expect(unresolved.some((r: any) => r.message_id === 'mention-freeze-1' && r.candidate_name === 'Improve Your Memory')).toBe(false);
+    } else {
+      expect(existsSync(unresolvedPath)).toBe(false);
+    }
   });
 
   test('shared inbox with human display name is held for manual review instead of creating a sender page', async () => {
@@ -1843,6 +1848,95 @@ created: 2011-12-31
     expect(stale).not.toContain('Take a moment now to check your account activity');
   });
 
+  test('quoted self-thread does not update a second duplicate self page', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'chris-winig.md'), `---
+aliases: ["Chris Winig", "chris.winig@gmail.com"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Chris Winig
+
+## Compiled Truth
+
+### Summary
+- Canonical self page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    writeFileSync(join(peopleDir, 'christopher-winig.md'), `---
+aliases: ["Christopher Winig"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Christopher Winig
+
+## Compiled Truth
+
+### Summary
+- Duplicate self page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-15.json'), JSON.stringify([
+      {
+        id: 'dup-self-1',
+        from: 'Christopher Winig <chris.winig@gmail.com>',
+        subject: 'Re: Your iCloud storage is full.',
+        snippet: 'I just checked. Your icloud storage has plenty of storage. Not sure why they sent you that. - Chris On Tue, Apr 14, 2026 at 9:16 AM Valerie Winig <valeriewinig@gmail.com> wrote: I have no idea. On Tue, Apr 14, 2026, 7:37 AM Christopher Winig <chris.winig@gmail.com> wrote:',
+        body: 'I just checked. Your icloud storage has plenty of storage. Not sure why they sent you that.\n\n- Chris\n\nOn Tue, Apr 14, 2026 at 9:16 AM Valerie Winig <valeriewinig@gmail.com> wrote:\n> I have no idea.\n> On Tue, Apr 14, 2026, 7:37 AM Christopher Winig <chris.winig@gmail.com> wrote:',
+        date: '2026-04-15T00:10:22Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me#inbox/dup-self-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me#inbox/dup-self-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-15'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const canonical = readFileSync(join(peopleDir, 'chris-winig.md'), 'utf-8');
+    const duplicate = readFileSync(join(peopleDir, 'christopher-winig.md'), 'utf-8');
+    expect(canonical).toContain('Re: Your iCloud storage is full.');
+    expect(duplicate).not.toContain('Re: Your iCloud storage is full.');
+    expect(duplicate).not.toContain('Valerie Winig');
+  });
+
   test('bare surname aliases do not trigger person-page updates from surname-only overlap', async () => {
     const dir = makeTempDir();
     const brainDir = join(dir, 'brain');
@@ -1959,6 +2053,173 @@ created: 2026-04-10
     expect(canonical).toContain('# Christopher Winig');
     expect(existsSync(join(brainDir, 'people', 'winig-christopher-at3-cvn73-im2-div.md'))).toBe(false);
     expect(existsSync(join(brainDir, 'companies', 'winig-christopher-at3-cvn73-im2-div.md'))).toBe(false);
+  });
+
+  test('merch royalty terms email does not emit junk unresolved mention candidates', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(join(companiesDir, '.raw'), { recursive: true });
+    writeFileSync(join(companiesDir, 'merch-on-demand.md'), `---
+aliases: ["Merch on Demand", "noreply-merch-on-demand@amazon.com"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Merch on Demand
+
+## Compiled Truth
+
+### Summary
+- Existing company note.
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-15.json'), JSON.stringify([
+      {
+        id: 'merch-royalty-1',
+        from: 'Merch on Demand <noreply-merch-on-demand@amazon.com>',
+        to: 'chris.winig@gmail.com',
+        reply_to: 'Merch on Demand <merch-events@amazon.com>',
+        delivered_to: 'chris.winig@gmail.com',
+        subject: 'Merch on Demand Update to Royalty Terms',
+        snippet: 'Merch on Demand Update to Royalty Terms Hello, Thank you for being a Merch on Demand content creator. With our introduction of royalty incentive groups, your performance driving sales with non-organic',
+        body: '',
+        date: '2026-04-15T01:13:12Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me#inbox/merch-royalty-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me#inbox/merch-royalty-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-15'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const merchPage = readFileSync(join(companiesDir, 'merch-on-demand.md'), 'utf-8');
+    expect(merchPage).not.toContain('Thank you for being a Merch on Demand content creator');
+    expect(merchPage).not.toContain('Update to Royalty Terms Hello');
+
+    const unresolvedPath = join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-15.json');
+    if (existsSync(unresolvedPath)) {
+      const unresolved = JSON.parse(readFileSync(unresolvedPath, 'utf-8'));
+      expect(unresolved).toEqual([]);
+    } else {
+      expect(existsSync(unresolvedPath)).toBe(false);
+    }
+  });
+
+  test('contaminated company page aliases do not block canonical self-page sender matches', async () => {
+    const dir = makeTempDir();
+    const brainDir = join(dir, 'brain');
+    writeResolver(brainDir);
+    const peopleDir = join(brainDir, 'people');
+    const companiesDir = join(brainDir, 'companies');
+    mkdirSync(join(peopleDir, '.raw'), { recursive: true });
+    mkdirSync(join(companiesDir, '.raw'), { recursive: true });
+    writeFileSync(join(peopleDir, 'chris-winig.md'), `---
+aliases: ["Chris Winig", "chris.winig@gmail.com"]
+tags: []
+status: active
+created: 2026-04-10
+---
+
+# Chris Winig
+
+## Compiled Truth
+
+### Summary
+- Canonical self page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    writeFileSync(join(companiesDir, 'clearsky-pharmacy.md'), `---
+aliases: ["cwinig", "chris.winig@gmail.com", "ClearSky Pharmacy", "info@clearskypharmacy.biz"]
+tags: []
+status: active
+created: 2022-12-31
+---
+
+# cwinig
+
+## Compiled Truth
+
+### Summary
+- Contaminated company page
+
+### Current State
+- Existing state
+
+### Open Threads
+- None
+
+### See Also
+- None
+
+---
+
+## Timeline
+`);
+    await Bun.$`node ${scriptPath} init --dir ${dir}`;
+    writeFileSync(join(dir, 'data', 'messages', '2026-04-15.json'), JSON.stringify([
+      {
+        id: 'contaminated-self-1',
+        from: 'Christopher Winig <chris.winig@gmail.com>',
+        subject: 'Re: Your iCloud storage is full.',
+        snippet: 'I just checked. Your icloud storage has plenty of storage. Not sure why they sent you that.',
+        body: 'I just checked. Your icloud storage has plenty of storage. Not sure why they sent you that.',
+        date: '2026-04-15T00:10:22Z',
+        gmail_link: 'https://mail.google.com/mail/u/?authuser=me#inbox/contaminated-self-1',
+        gmail_markdown: '[Open in Gmail](https://mail.google.com/mail/u/?authuser=me#inbox/contaminated-self-1)',
+        is_signature: false,
+        is_noise: false,
+        is_new: true
+      }
+    ], null, 2));
+
+    const proc = Bun.spawn(['node', scriptPath, 'enrich', '--dir', dir, '--brain-dir', brainDir, '--date', '2026-04-15'], {
+      cwd: repoRoot, stdout: 'pipe', stderr: 'pipe',
+    });
+    expect(await proc.exited).toBe(0);
+
+    const person = readFileSync(join(peopleDir, 'chris-winig.md'), 'utf-8');
+    const company = readFileSync(join(companiesDir, 'clearsky-pharmacy.md'), 'utf-8');
+    expect(person).toContain('Re: Your iCloud storage is full.');
+    expect(company).not.toContain('Re: Your iCloud storage is full.');
+
+    const unresolvedPath = join(dir, 'data', 'reports', 'unresolved-entities', '2026-04-15.json');
+    if (existsSync(unresolvedPath)) {
+      const unresolved = JSON.parse(readFileSync(unresolvedPath, 'utf-8'));
+      expect(unresolved.some((r: any) => r.message_id === 'contaminated-self-1' && /ambiguous/.test(r.reason))).toBe(false);
+    }
   });
 
   test('bank email chrome is filtered out of Open Threads', async () => {
