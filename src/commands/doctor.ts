@@ -25,10 +25,9 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
   // --- Filesystem checks (always run, no DB needed) ---
 
   // 1. Resolver health
-  const repoRoot = findRepoRoot();
-  if (repoRoot) {
-    const skillsDir = join(repoRoot, 'skills');
-    const report = checkResolvable(skillsDir);
+  const repoInfo = findRepoRoot();
+  if (repoInfo?.layout === 'skills') {
+    const report = checkResolvable(repoInfo.skillsDir);
     if (report.ok && report.issues.length === 0) {
       checks.push({
         name: 'resolver_health',
@@ -52,14 +51,19 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
       };
       checks.push(check);
     }
+  } else if (repoInfo?.layout === 'brain') {
+    checks.push({
+      name: 'resolver_health',
+      status: 'ok',
+      message: 'Top-level RESOLVER.md detected (brain layout, no skills directory required)',
+    });
   } else {
-    checks.push({ name: 'resolver_health', status: 'warn', message: 'Could not find skills directory' });
+    checks.push({ name: 'resolver_health', status: 'warn', message: 'Could not find skills directory or top-level RESOLVER.md' });
   }
 
   // 2. Skill conformance
-  if (repoRoot) {
-    const skillsDir = join(repoRoot, 'skills');
-    const conformanceResult = checkSkillConformance(skillsDir);
+  if (repoInfo?.layout === 'skills') {
+    const conformanceResult = checkSkillConformance(repoInfo.skillsDir);
     checks.push(conformanceResult);
   }
 
@@ -177,11 +181,26 @@ export async function runDoctor(engine: BrainEngine | null, args: string[]) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Find the GBrain repo root by walking up from cwd looking for skills/RESOLVER.md */
-function findRepoRoot(): string | null {
+type RepoInfo =
+  | { root: string; layout: 'skills'; skillsDir: string }
+  | { root: string; layout: 'brain'; skillsDir: null };
+
+/** Find the GBrain repo root by walking up from cwd.
+ * Supports both:
+ * - gbrain repo layout: skills/RESOLVER.md
+ * - live brain layout: top-level RESOLVER.md
+ */
+function findRepoRoot(): RepoInfo | null {
   let dir = process.cwd();
   for (let i = 0; i < 10; i++) {
-    if (existsSync(join(dir, 'skills', 'RESOLVER.md'))) return dir;
+    const nestedSkillsResolver = join(dir, 'skills', 'RESOLVER.md');
+    if (existsSync(nestedSkillsResolver)) {
+      return { root: dir, layout: 'skills', skillsDir: join(dir, 'skills') };
+    }
+    const topLevelResolver = join(dir, 'RESOLVER.md');
+    if (existsSync(topLevelResolver)) {
+      return { root: dir, layout: 'brain', skillsDir: null };
+    }
     const parent = join(dir, '..');
     if (parent === dir) break;
     dir = parent;

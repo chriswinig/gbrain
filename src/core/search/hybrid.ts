@@ -415,12 +415,18 @@ async function cosineReScore(
 }
 
 export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (!a?.length || !b?.length) return 0;
+  if (a.length !== b.length) return 0;
   let dot = 0, magA = 0, magB = 0;
   for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    magA += a[i] * a[i];
-    magB += b[i] * b[i];
+    const av = a[i];
+    const bv = b[i];
+    if (!Number.isFinite(av) || !Number.isFinite(bv)) return 0;
+    dot += av * bv;
+    magA += av * av;
+    magB += bv * bv;
   }
   const denom = Math.sqrt(magA) * Math.sqrt(magB);
-  return denom === 0 ? 0 : dot / denom;
+  const score = denom === 0 ? 0 : dot / denom;
+  return Number.isFinite(score) ? score : 0;
 }

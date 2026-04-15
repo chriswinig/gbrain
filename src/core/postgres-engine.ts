@@ -19,6 +19,24 @@ import { GBrainError } from './types.ts';
 import * as db from './db.ts';
 import { validateSlug, contentHash, rowToPage, rowToChunk, rowToSearchResult } from './utils.ts';
 
+function normalizeEmbedding(value: unknown): Float32Array | null {
+  if (!value) return null;
+  if (value instanceof Float32Array) return value;
+  if (Array.isArray(value)) {
+    const nums = value.map(Number);
+    return nums.every(Number.isFinite) ? new Float32Array(nums) : null;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return null;
+    const body = trimmed.slice(1, -1).trim();
+    if (!body) return new Float32Array();
+    const nums = body.split(',').map(s => Number(s.trim()));
+    return nums.every(Number.isFinite) ? new Float32Array(nums) : null;
+  }
+  return null;
+}
+
 export class PostgresEngine implements BrainEngine {
   private _sql: ReturnType<typeof postgres> | null = null;
 
@@ -275,7 +293,8 @@ export class PostgresEngine implements BrainEngine {
     `;
     const result = new Map<number, Float32Array>();
     for (const row of rows) {
-      if (row.embedding) result.set(row.id as number, row.embedding as Float32Array);
+      const parsed = normalizeEmbedding(row.embedding);
+      if (parsed) result.set(row.id as number, parsed);
     }
     return result;
   }

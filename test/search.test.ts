@@ -150,6 +150,18 @@ describe('cosineSimilarity', () => {
     b[5] = 1.0;
     expect(cosineSimilarity(a, b)).toBe(0);
   });
+
+  test('mismatched vector lengths return 0 instead of NaN', () => {
+    const a = new Float32Array([1, 2, 3]);
+    const b = new Float32Array([1, 2]);
+    expect(cosineSimilarity(a, b)).toBe(0);
+  });
+
+  test('non-finite vector values return 0 instead of NaN', () => {
+    const a = new Float32Array([1, 2, 3]);
+    const b = new Float32Array([1, Number.NaN, 3]);
+    expect(cosineSimilarity(a, b)).toBe(0);
+  });
 });
 
 describe('CJK word count in expansion', () => {
