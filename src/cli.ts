@@ -173,9 +173,10 @@ function formatResult(opName: string, result: unknown): string {
     case 'query': {
       const results = result as any[];
       if (results.length === 0) return 'No results.\n';
-      return results.map(r =>
-        `[${r.score?.toFixed(4) || '?'}] ${r.slug}${r.graph_depth ? ` [graph d${r.graph_depth}${r.graph_source_slugs?.length ? ` via ${r.graph_source_slugs.join(', ')}` : ''}]` : ''} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
-      ).join('\n') + '\n';
+      return results.map(r => {
+        const scoreText = Number.isFinite(r.score) ? r.score.toFixed(4) : '?';
+        return `[${scoreText}] ${r.slug}${r.graph_depth ? ` [graph d${r.graph_depth}${r.graph_source_slugs?.length ? ` via ${r.graph_source_slugs.join(', ')}` : ''}]` : ''} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`;
+      }).join('\n') + '\n';
     }
     case 'get_tags': {
       const tags = result as string[];
