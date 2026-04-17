@@ -1,10 +1,12 @@
 import { readFileSync, statSync, lstatSync } from 'fs';
 import { createHash } from 'crypto';
+import { relative } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { parseMarkdown } from './markdown.ts';
 import { chunkText } from './chunkers/recursive.ts';
 import { embedBatch } from './embedding.ts';
 import { buildPageResolver, extractResolvedLinks } from './link-extraction.ts';
+import type { ResolvedLinkTarget } from './link-extraction.ts';
 import { slugifyPath } from './sync.ts';
 import type { ChunkInput } from './types.ts';
 
@@ -15,10 +17,21 @@ export interface ImportResult {
   error?: string;
 }
 
+export interface ImportOptions {
+  noEmbed?: boolean;
+  resolver?: Map<string, ResolvedLinkTarget>;
+}
+
 const MAX_FILE_SIZE = 5_000_000; // 5MB
 const PAGE_RESOLVER_BATCH_SIZE = 500;
 
-async function listAllPages(engine: BrainEngine) {
+type ResolverPage = {
+  slug: string;
+  title?: string;
+  frontmatter?: Record<string, unknown>;
+};
+
+export async function listAllPages(engine: BrainEngine): Promise<ResolverPage[]> {
   const pages = [];
   let offset = 0;
 
@@ -31,6 +44,46 @@ async function listAllPages(engine: BrainEngine) {
   }
 
   return pages;
+}
+
+function pageFromImportFile(filePath: string, relativePath: string): ResolverPage | null {
+  const lstat = lstatSync(filePath);
+  if (lstat.isSymbolicLink()) return null;
+
+  const stat = statSync(filePath);
+  if (stat.size > MAX_FILE_SIZE) return null;
+
+  const content = readFileSync(filePath, 'utf-8');
+  const parsed = parseMarkdown(content, relativePath);
+  const expectedSlug = slugifyPath(relativePath);
+  if (parsed.slug !== expectedSlug) return null;
+
+  return {
+    slug: expectedSlug,
+    title: parsed.title,
+    frontmatter: parsed.frontmatter,
+  };
+}
+
+export async function buildImportResolver(
+  engine: BrainEngine,
+  rootDir: string,
+  files: string[],
+): Promise<Map<string, ResolvedLinkTarget>> {
+  const pagesBySlug = new Map<string, ResolverPage>();
+
+  for (const page of await listAllPages(engine)) {
+    pagesBySlug.set(page.slug, page);
+  }
+
+  for (const filePath of files) {
+    const relativePath = relative(rootDir, filePath);
+    const page = pageFromImportFile(filePath, relativePath);
+    if (!page) continue;
+    pagesBySlug.set(page.slug, page);
+  }
+
+  return buildPageResolver(Array.from(pagesBySlug.values()));
 }
 
 /**
@@ -49,7 +102,7 @@ export async function importFromContent(
   engine: BrainEngine,
   slug: string,
   content: string,
-  opts: { noEmbed?: boolean } = {},
+  opts: ImportOptions = {},
 ): Promise<ImportResult> {
   // Reject oversized payloads before any parsing, chunking, or embedding happens.
   // Uses Buffer.byteLength to count UTF-8 bytes the same way disk size would,
@@ -65,8 +118,7 @@ export async function importFromContent(
   }
 
   const parsed = parseMarkdown(content, slug + '.md');
-  const existingPages = await listAllPages(engine);
-  const resolver = buildPageResolver(existingPages as any[]);
+  const resolver = opts.resolver ?? buildPageResolver(await listAllPages(engine));
   const outboundLinks = extractResolvedLinks(
     [parsed.compiled_truth, parsed.timeline].filter(Boolean).join('\n\n'),
     slug,
@@ -176,7 +228,7 @@ export async function importFromFile(
   engine: BrainEngine,
   filePath: string,
   relativePath: string,
-  opts: { noEmbed?: boolean } = {},
+  opts: ImportOptions = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
   const lstat = lstatSync(filePath);

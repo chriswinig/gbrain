@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { importFile, importFromContent } from '../src/core/import-file.ts';
+import { buildPageResolver } from '../src/core/link-extraction.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 const TMP = join(import.meta.dir, '.tmp-import-test');
@@ -320,6 +321,44 @@ Met [[Angelica Hernandez]] during the trip.
     expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
       ['concepts/wikilinks-paginated', 'people/angelica-hernandez'],
     ]));
+  });
+
+  test('uses provided resolver without fetching all pages again', async () => {
+    const filePath = join(TMP, 'wikilinks-prebuilt-resolver.md');
+    writeFileSync(filePath, `---
+type: concept
+title: Prebuilt Resolver Source
+---
+
+Met [[Angelica Hernandez]] during the trip.
+`);
+
+    let listPagesCalls = 0;
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      getTags: () => Promise.resolve([]),
+      getLinks: () => Promise.resolve([]),
+      listPages: () => {
+        listPagesCalls++;
+        return Promise.resolve([]);
+      },
+    });
+
+    const resolver = buildPageResolver([
+      { slug: 'people/angelica-hernandez', title: 'Angelica Hernandez', frontmatter: {} },
+    ]);
+
+    await importFile(engine, filePath, 'concepts/wikilinks-prebuilt-resolver.md', {
+      noEmbed: true,
+      resolver,
+    });
+
+    const calls = (engine as any)._calls;
+    const addLinkCalls = calls.filter((c: any) => c.method === 'addLink');
+    expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
+      ['concepts/wikilinks-prebuilt-resolver', 'people/angelica-hernandez'],
+    ]));
+    expect(listPagesCalls).toBe(0);
   });
 
   test('chunks compiled_truth and timeline separately', async () => {

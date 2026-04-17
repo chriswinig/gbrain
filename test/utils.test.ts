@@ -98,6 +98,16 @@ describe('rowToChunk', () => {
     }, true);
     expect(chunk.embedding).not.toBeNull();
   });
+
+  test('parses string embeddings when requested', () => {
+    const chunk = rowToChunk({
+      id: 1, page_id: 1, chunk_index: 0, chunk_text: 'text',
+      chunk_source: 'compiled_truth', embedding: '[0.5, -0.25, 1]',
+      model: 'test', token_count: 5, embedded_at: '2024-01-01',
+    }, true);
+    expect(chunk.embedding).not.toBeNull();
+    expect(Array.from(chunk.embedding!)).toEqual([0.5, -0.25, 1]);
+  });
 });
 
 describe('rowToSearchResult', () => {

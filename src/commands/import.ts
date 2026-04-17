@@ -3,7 +3,7 @@ import { execFileSync } from 'child_process';
 import { join, relative } from 'path';
 import { cpus, totalmem, homedir } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
-import { importFile } from '../core/import-file.ts';
+import { buildImportResolver, importFile } from '../core/import-file.ts';
 import { loadConfig } from '../core/config.ts';
 
 function defaultWorkers(): number {
@@ -62,6 +62,8 @@ export async function runImport(engine: BrainEngine, args: string[]) {
     console.log(`Using ${actualWorkers} parallel workers`);
   }
 
+  const importResolver = await buildImportResolver(engine, dir, files);
+
   let imported = 0;
   let skipped = 0;
   let errors = 0;
@@ -82,7 +84,7 @@ export async function runImport(engine: BrainEngine, args: string[]) {
   async function processFile(eng: BrainEngine, filePath: string) {
     const relativePath = relative(dir, filePath);
     try {
-      const result = await importFile(eng, filePath, relativePath, { noEmbed });
+      const result = await importFile(eng, filePath, relativePath, { noEmbed, resolver: importResolver });
       if (result.status === 'imported') {
         imported++;
         chunksCreated += result.chunks;
