@@ -185,26 +185,43 @@ type RepoInfo =
   | { root: string; layout: 'skills'; skillsDir: string }
   | { root: string; layout: 'brain'; skillsDir: null };
 
+function classifyRepoDir(dir: string): RepoInfo | null {
+  const nestedSkillsResolver = join(dir, 'skills', 'RESOLVER.md');
+  if (existsSync(nestedSkillsResolver)) {
+    return { root: dir, layout: 'skills', skillsDir: join(dir, 'skills') };
+  }
+  const topLevelResolver = join(dir, 'RESOLVER.md');
+  if (existsSync(topLevelResolver)) {
+    return { root: dir, layout: 'brain', skillsDir: null };
+  }
+  return null;
+}
+
 /** Find the GBrain repo root by walking up from cwd.
  * Supports both:
  * - gbrain repo layout: skills/RESOLVER.md
  * - live brain layout: top-level RESOLVER.md
+ *
+ * If cwd is unrelated (for example a cron shell or Hermes scripts directory),
+ * also probe the default live brain path at ~/.hermes/knowledge.
  */
 function findRepoRoot(): RepoInfo | null {
   let dir = process.cwd();
   for (let i = 0; i < 10; i++) {
-    const nestedSkillsResolver = join(dir, 'skills', 'RESOLVER.md');
-    if (existsSync(nestedSkillsResolver)) {
-      return { root: dir, layout: 'skills', skillsDir: join(dir, 'skills') };
-    }
-    const topLevelResolver = join(dir, 'RESOLVER.md');
-    if (existsSync(topLevelResolver)) {
-      return { root: dir, layout: 'brain', skillsDir: null };
-    }
+    const info = classifyRepoDir(dir);
+    if (info) return info;
     const parent = join(dir, '..');
     if (parent === dir) break;
     dir = parent;
   }
+
+  const home = process.env.HOME;
+  if (home) {
+    const defaultBrainDir = join(home, '.hermes', 'knowledge');
+    const info = classifyRepoDir(defaultBrainDir);
+    if (info) return info;
+  }
+
   return null;
 }
 
