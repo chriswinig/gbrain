@@ -14,6 +14,7 @@
 
 import type { BrainEngine } from './engine.ts';
 import type { PageType } from './types.ts';
+import { posix } from 'path';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -407,8 +408,7 @@ export async function isAutoLinkEnabled(engine: BrainEngine): Promise<boolean> {
   if (val == null) return true;
   const normalized = val.trim().toLowerCase();
   return !['false', '0', 'no', 'off'].includes(normalized);
-
-import { posix } from 'path';
+}
 
 interface PageLike {
   slug: string;
