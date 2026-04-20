@@ -37,11 +37,8 @@ This skill guarantees:
 - Transcripts (video/audio) saved in raw and human-readable formats
 - Entity extraction: every person and company mentioned gets back-linked
 - Raw source files preserved via `gbrain files upload-raw`
+- Follows `skills/conventions/quality.md` for citations, back-links, and notability gate
 - Filing by primary subject, not by media format
-
-## Iron Law: Back-Linking (MANDATORY)
-
-Every mention of a person or company with a brain page MUST create a back-link.
 
 ## Phases
 

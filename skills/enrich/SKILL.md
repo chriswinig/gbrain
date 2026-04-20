@@ -28,7 +28,7 @@ Enrich person and company pages from external sources. Scale effort to importanc
 
 ## Contract
 
-This skill guarantees:
+- Shared quality rules follow `skills/conventions/quality.md` (citations, back-links, notability gate).
 - Every enriched page has compiled truth (State section) with inline citations
 - Every enriched page has a timeline with dated entries
 - Back-links are created bidirectionally
@@ -37,32 +37,11 @@ This skill guarantees:
 
 > **Filing rule:** Read `skills/_brain-filing-rules.md` before creating any new page.
 
-## Iron Law: Back-Linking (MANDATORY)
-
-Every mention of a person or company with a brain page MUST create a back-link
-FROM that entity's page TO the page mentioning them. An unlinked mention is a
-broken brain. See `skills/_brain-filing-rules.md` for format.
-
 ## Philosophy
 
 A brain page should read like an intelligence dossier, not a LinkedIn scrape.
 Facts are table stakes. Texture is the value -- what do they believe, what are
 they building, what makes them tick, where are they headed.
-
-## Citation Requirements (MANDATORY)
-
-Every fact must carry an inline `[Source: ...]` citation.
-
-Three formats:
-- **Direct attribution:** `[Source: User, {context}, YYYY-MM-DD]`
-- **API/external:** `[Source: {provider} enrichment, YYYY-MM-DD]`
-- **Synthesis:** `[Source: compiled from {list of sources}]`
-
-Source precedence (highest to lowest):
-1. User's direct statements
-2. Compiled truth (pre-existing brain synthesis)
-3. Timeline entries (raw evidence)
-4. External sources (API enrichment, web search)
 
 When sources conflict, note the contradiction with both citations.
 

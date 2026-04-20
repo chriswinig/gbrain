@@ -100,6 +100,15 @@ describe('extractTimelineFromContent', () => {
     expect(entries[0].detail).toContain('Marcus joins the board');
   });
 
+  it('extracts header-only date entries with bullet content underneath', () => {
+    const content = `## Timeline\n\n### 2026-04-13\n- Created corrective stretching routine based on prior findings.\n  [Source: Chris direct, Claude session, 2026-04-13]`;
+    const entries = extractTimelineFromContent(content, 'personal/corrective-stretching-routine');
+    expect(entries).toHaveLength(1);
+    expect(entries[0].date).toBe('2026-04-13');
+    expect(entries[0].summary).toBe('Created corrective stretching routine based on prior findings.');
+    expect(entries[0].detail).toContain('[Source: Chris direct, Claude session, 2026-04-13]');
+  });
+
   it('returns empty for no timeline content', () => {
     const content = 'Just plain text without dates.';
     expect(extractTimelineFromContent(content, 'test')).toHaveLength(0);

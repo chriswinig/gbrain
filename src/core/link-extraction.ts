@@ -326,6 +326,7 @@ export interface TimelineCandidate {
 // Match: `- **YYYY-MM-DD** | summary` or `- **YYYY-MM-DD** -- summary`
 // or `- **YYYY-MM-DD** - summary` or just `**YYYY-MM-DD** | summary`.
 const TIMELINE_LINE_RE = /^\s*-?\s*\*\*(\d{4}-\d{2}-\d{2})\*\*\s*[|\-–—]+\s*(.+?)\s*$/;
+const TIMELINE_HEADER_ONLY_RE = /^###\s+(\d{4}-\d{2}-\d{2})\s*$/;
 
 /**
  * Parse timeline entries from content. Looks at:
@@ -344,6 +345,42 @@ export function parseTimelineEntries(content: string): TimelineCandidate[] {
   while (i < lines.length) {
     const m = TIMELINE_LINE_RE.exec(lines[i]);
     if (!m) {
+      const headerOnly = TIMELINE_HEADER_ONLY_RE.exec(lines[i]);
+      if (headerOnly) {
+        const date = headerOnly[1];
+        if (!isValidDate(date)) {
+          i++;
+          continue;
+        }
+
+        const bodyLines: string[] = [];
+        let j = i + 1;
+        while (j < lines.length) {
+          const next = lines[j];
+          if (TIMELINE_LINE_RE.test(next)) break;
+          if (TIMELINE_HEADER_ONLY_RE.test(next)) break;
+          if (/^##\s/.test(next)) break;
+          if (/^#{4,6}\s/.test(next)) break;
+          if (next.trim().length === 0 && bodyLines.length === 0) {
+            j++;
+            continue;
+          }
+          if (next.trim().length === 0 && bodyLines.length > 0) break;
+          bodyLines.push(next.trim());
+          j++;
+        }
+
+        const normalized = bodyLines
+          .map(line => line.replace(/^[-*]\s+/, '').trim())
+          .filter(Boolean);
+        const summary = normalized[0] || '';
+        const detail = normalized.slice(1).join(' ').trim();
+        if (summary.length > 0) {
+          result.push({ date, summary, detail });
+          i = j;
+          continue;
+        }
+      }
       i++;
       continue;
     }

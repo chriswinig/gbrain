@@ -8,7 +8,6 @@ description: |
 triggers:
   - "brain health"
   - "check backlinks"
-  - "citation audit"
   - "maintenance"
   - "orphan pages"
   - "stale pages"
@@ -131,6 +130,8 @@ Spot-check pages for missing `[Source: ...]` citations:
 - Check that compiled truth (above the line) has inline citations
 - Check that timeline entries have source attribution
 - Flag pages where facts appear without provenance
+- If the task is citation-specific cleanup rather than broad maintenance,
+  hand off to `skills/citation-fixer/SKILL.md`
 
 ### Tag consistency
 Inconsistent tagging (e.g., "vc" vs "venture-capital", "ai" vs "artificial-intelligence").
