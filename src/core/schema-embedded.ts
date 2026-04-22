@@ -225,6 +225,7 @@ BEGIN
   RETURN NEW;
 END;
 \$\$ LANGUAGE plpgsql;
+ALTER FUNCTION public.update_page_search_vector() SET search_path = public, pg_temp;
 
 DROP TRIGGER IF EXISTS trg_pages_search_vector ON pages;
 CREATE TRIGGER trg_pages_search_vector
@@ -243,6 +244,7 @@ BEGIN
   RETURN NEW;
 END;
 \$\$ LANGUAGE plpgsql;
+ALTER FUNCTION public.update_page_search_vector_from_timeline() SET search_path = public, pg_temp;
 
 DROP TRIGGER IF EXISTS trg_timeline_search_vector ON timeline_entries;
 CREATE TRIGGER trg_timeline_search_vector
@@ -279,5 +281,44 @@ BEGIN
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;
   END IF;
+END \$\$;
+
+DO \$\$
+DECLARE
+  tbl text;
+  tables text[] := ARRAY[
+    'access_tokens',
+    'config',
+    'content_chunks',
+    'files',
+    'ingest_log',
+    'links',
+    'mcp_request_log',
+    'page_versions',
+    'pages',
+    'raw_data',
+    'tags',
+    'timeline_entries'
+  ];
+BEGIN
+  FOREACH tbl IN ARRAY tables LOOP
+    IF EXISTS (
+      SELECT 1
+      FROM pg_tables
+      WHERE schemaname = 'public'
+        AND tablename = tbl
+    ) AND NOT EXISTS (
+      SELECT 1
+      FROM pg_policies
+      WHERE schemaname = 'public'
+        AND tablename = tbl
+        AND policyname = 'Deny direct client access'
+    ) THEN
+      EXECUTE format(
+        'CREATE POLICY "Deny direct client access" ON public.%I AS PERMISSIVE FOR ALL TO PUBLIC USING (false) WITH CHECK (false)',
+        tbl
+      );
+    END IF;
+  END LOOP;
 END \$\$;
 `;

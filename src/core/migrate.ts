@@ -101,6 +101,56 @@ const MIGRATIONS: Migration[] = [
       END $$;
     `,
   },
+  {
+    version: 6,
+    name: 'explicit_deny_policies_and_search_path_hardening',
+    sql: `
+      DO $$
+      DECLARE
+        tbl text;
+        tables text[] := ARRAY[
+          'access_tokens',
+          'config',
+          'content_chunks',
+          'files',
+          'ingest_log',
+          'links',
+          'mcp_request_log',
+          'page_versions',
+          'pages',
+          'raw_data',
+          'tags',
+          'timeline_entries'
+        ];
+      BEGIN
+        FOREACH tbl IN ARRAY tables LOOP
+          IF EXISTS (
+            SELECT 1
+            FROM pg_tables
+            WHERE schemaname = 'public'
+              AND tablename = tbl
+          ) AND NOT EXISTS (
+            SELECT 1
+            FROM pg_policies
+            WHERE schemaname = 'public'
+              AND tablename = tbl
+              AND policyname = 'Deny direct client access'
+          ) THEN
+            EXECUTE format(
+              'CREATE POLICY "Deny direct client access" ON public.%I AS PERMISSIVE FOR ALL TO PUBLIC USING (false) WITH CHECK (false)',
+              tbl
+            );
+          END IF;
+        END LOOP;
+      END $$;
+
+      ALTER FUNCTION public.update_page_search_vector()
+        SET search_path = public, pg_temp;
+
+      ALTER FUNCTION public.update_page_search_vector_from_timeline()
+        SET search_path = public, pg_temp;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
