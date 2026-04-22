@@ -269,6 +269,8 @@ BEGIN
     ALTER TABLE ingest_log ENABLE ROW LEVEL SECURITY;
     ALTER TABLE config ENABLE ROW LEVEL SECURITY;
     ALTER TABLE files ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE access_tokens ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE mcp_request_log ENABLE ROW LEVEL SECURITY;
     RAISE NOTICE 'RLS enabled on all tables (role % has BYPASSRLS)', current_user;
   ELSE
     RAISE WARNING 'Skipping RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;

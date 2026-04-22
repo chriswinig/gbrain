@@ -82,6 +82,25 @@ const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 5,
+    name: 'enable_rls_for_remote_auth_tables',
+    sql: `
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT rolbypassrls INTO has_bypass FROM pg_roles WHERE rolname = current_user;
+        IF has_bypass THEN
+          ALTER TABLE access_tokens ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE mcp_request_log ENABLE ROW LEVEL SECURITY;
+          RAISE NOTICE 'RLS enabled on remote auth tables (role % has BYPASSRLS)', current_user;
+        ELSE
+          RAISE WARNING 'Skipping remote auth table RLS: role % does not have BYPASSRLS privilege. Run as postgres role to enable.', current_user;
+        END IF;
+      END $$;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0
