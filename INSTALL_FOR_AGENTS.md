@@ -3,6 +3,17 @@
 Read this entire file, then follow the steps. Ask the user for API keys when needed.
 Target: ~30 minutes to a fully working brain.
 
+## Step 0: If you are not Claude Code
+
+Read `AGENTS.md` at the repo root first. It's the non-Claude-agent operating
+protocol (install, read order, trust boundary, common tasks). Claude Code reads
+`CLAUDE.md` automatically and can skip ahead.
+
+If you fetched this file by URL without cloning yet, the companion files live at:
+- `https://raw.githubusercontent.com/garrytan/gbrain/master/AGENTS.md` — start here
+- `https://raw.githubusercontent.com/garrytan/gbrain/master/llms.txt` — full doc map
+- `https://raw.githubusercontent.com/garrytan/gbrain/master/llms-full.txt` — same map, inlined
+
 ## Step 1: Install GBrain
 
 ```bash
@@ -14,6 +25,11 @@ bun install && bun link
 
 Verify: `gbrain --version` should print a version number. If `gbrain` is not found,
 restart the shell or add the PATH export to the shell profile.
+
+> **Do NOT use `bun install -g github:garrytan/gbrain`.** Bun blocks the top-level
+> postinstall hook on global installs, so schema migrations never run and the CLI
+> aborts with `Aborted()` when it opens PGLite. Use the `git clone + bun link` path
+> above. Tracking issue: [#218](https://github.com/garrytan/gbrain/issues/218).
 
 ## Step 2: API Keys
 
@@ -113,8 +129,9 @@ Set up using your platform's scheduler (OpenClaw cron, Railway cron, crontab):
 - **Live sync** (every 15 min): `gbrain sync --repo ~/brain && gbrain embed --stale`
 - **Auto-update** (daily): `gbrain check-update --json` (tell user, never auto-install)
 - **Dream cycle** (nightly): read `docs/guides/cron-schedule.md` for the full protocol.
-  Entity sweep, citation fixes, memory consolidation. This is what makes the brain
-  compound. Do not skip it.
+  Entity sweep, citation fixes, memory consolidation, plus (v0.23+) overnight conversation
+  synthesis and cross-session pattern detection. 8 phases, one cron-friendly command. This
+  is what makes the brain compound. Do not skip it.
 - **Weekly**: `gbrain doctor --json && gbrain embed --stale`
 
 ## Step 8: Integrations
@@ -133,7 +150,7 @@ actually works) is the most important.
 ## Upgrade
 
 ```bash
-cd ~/gbrain && git pull origin main && bun install
+cd ~/gbrain && git pull origin master && bun install
 gbrain init                           # apply schema migrations (idempotent)
 gbrain post-upgrade                   # show migration notes for the version range
 ```

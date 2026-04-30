@@ -1,6 +1,6 @@
 import type {
   Page, PageInput, PageFilters,
-  Chunk, ChunkInput,
+  Chunk, ChunkInput, StaleChunkRow,
   SearchResult, SearchOpts,
   Link, GraphNode, GraphPath,
   TimelineEntry, TimelineInput, TimelineOpts,
@@ -9,6 +9,7 @@ import type {
   BrainStats, BrainHealth,
   IngestLogEntry, IngestLogInput,
   EngineConfig,
+  CodeEdgeInput, CodeEdgeResult,
 } from './types.ts';
 
 /** Input row for addLinksBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -28,6 +29,21 @@ export interface LinkBatchInput {
   origin_slug?: string;
   /** Frontmatter field name (e.g. 'key_people', 'investors'). */
   origin_field?: string;
+  /**
+   * v0.18.0: source id for each endpoint. When omitted, the engine JOINs
+   * against `source_id='default'`. Pass explicit values when the edge
+   * lives in a non-default source OR crosses sources.
+   *
+   * Without these fields, the batch JOIN `pages.slug = v.from_slug` fans
+   * out across every source containing that slug, silently creating wrong
+   * edges in a multi-source brain. The source_id filter eliminates the
+   * fan-out. Origin pages (frontmatter provenance) get their own
+   * source_id so reconciliation can't delete edges from another source's
+   * frontmatter.
+   */
+  from_source_id?: string;
+  to_source_id?: string;
+  origin_source_id?: string;
 }
 
 /** Input row for addTimelineEntriesBatch. Optional fields default to '' (matches NOT NULL DDL). */
@@ -37,6 +53,50 @@ export interface TimelineBatchInput {
   source?: string;
   summary: string;
   detail?: string;
+  /**
+   * v0.18.0: source id for the owning page. When omitted, the engine JOINs
+   * against `source_id='default'`. Without this, two pages sharing the
+   * same slug across sources would fan out timeline rows to both.
+   */
+  source_id?: string;
+}
+
+/**
+ * A single dedicated database connection, isolated from the engine's pool.
+ *
+ * Used by migration paths that need session-level GUCs (e.g.
+ * `SET statement_timeout = '600000'` before a `CREATE INDEX CONCURRENTLY`)
+ * without leaking into the shared pool, and by write-quiesce designs
+ * that need a session-lifetime Postgres advisory lock that survives
+ * across transaction boundaries.
+ *
+ * On Postgres: backed by postgres-js `sql.reserve()`; the same backend
+ * process serves every `executeRaw` call within the callback. Released
+ * automatically when the callback returns or throws.
+ *
+ * On PGLite: a thin pass-through. PGLite has no pool, so every call is
+ * already on the single backing connection. The interface is still
+ * exposed so cross-engine callers don't need to branch.
+ *
+ * Not safe to call from inside `transaction()`. The transaction holds a
+ * different backend; reserving a second one can deadlock on a row the
+ * transaction itself is waiting to write.
+ */
+export interface ReservedConnection {
+  executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+}
+
+/** Dream-cycle Haiku verdict on whether a transcript is worth processing. */
+export interface DreamVerdict {
+  worth_processing: boolean;
+  reasons: string[];
+  judged_at: string;
+}
+
+/** Input shape for putDreamVerdict — judged_at defaults to now() server-side. */
+export interface DreamVerdictInput {
+  worth_processing: boolean;
+  reasons: string[];
 }
 
 /** Maximum results returned by search operations. Internal bulk operations (listPages) are not clamped. */
@@ -50,11 +110,20 @@ export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, c
 }
 
 export interface BrainEngine {
+  /** Discriminator: lets migrations and other consumers branch on engine kind without instanceof + dynamic imports. */
+  readonly kind: 'postgres' | 'pglite';
+
   // Lifecycle
   connect(config: EngineConfig): Promise<void>;
   disconnect(): Promise<void>;
   initSchema(): Promise<void>;
   transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
+  /**
+   * Run `fn` with a dedicated connection (Postgres: reserved backend;
+   * PGLite: pass-through). See `ReservedConnection` for semantics and
+   * usage constraints. Release is automatic.
+   */
+  withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T>;
 
   // Pages CRUD
   getPage(slug: string): Promise<Page | null>;
@@ -77,6 +146,21 @@ export interface BrainEngine {
   // Chunks
   upsertChunks(slug: string, chunks: ChunkInput[]): Promise<void>;
   getChunks(slug: string): Promise<Chunk[]>;
+  /**
+   * Count chunks across the entire brain where embedded_at IS NULL.
+   * Pre-flight short-circuit for `embed --stale` so a 100%-embedded brain
+   * does no further work after a single SELECT count(*) (~50 bytes wire).
+   */
+  countStaleChunks(): Promise<number>;
+  /**
+   * Return every chunk where embedded_at IS NULL, with the metadata needed
+   * to call embedBatch + upsertChunks. The `embedding` column is omitted
+   * by design — stale rows have NULL embeddings, so shipping them wastes
+   * wire bytes for no gain. Caller groups by slug, embeds, and re-upserts.
+   *
+   * Bounded by an internal LIMIT of 100000 to mirror listPages.
+   */
+  listStaleChunks(): Promise<StaleChunkRow[]>;
   deleteChunks(slug: string): Promise<void>;
 
   // Links
@@ -149,6 +233,13 @@ export interface BrainEngine {
    * Slugs with zero inbound links are present in the map with value 0.
    */
   getBacklinkCounts(slugs: string[]): Promise<Map<string, number>>;
+  /**
+   * Return every page with no inbound links (from any source).
+   * Domain comes from the frontmatter `domain` field (null if unset).
+   * The caller filters pseudo-pages + derives display domain.
+   * Used by `gbrain orphans` and `runCycle`'s orphan sweep phase.
+   */
+  findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>>;
 
   // Tags
   addTag(slug: string, tag: string): Promise<void>;
@@ -180,6 +271,12 @@ export interface BrainEngine {
   putRawData(slug: string, source: string, data: object): Promise<void>;
   getRawData(slug: string, source?: string): Promise<RawData[]>;
 
+  // Dream-cycle significance verdict cache (v0.23).
+  // Keyed by (file_path, content_hash). Distinct from raw_data, which is
+  // page-scoped — transcripts being judged aren't pages yet.
+  getDreamVerdict(filePath: string, contentHash: string): Promise<DreamVerdict | null>;
+  putDreamVerdict(filePath: string, contentHash: string, verdict: DreamVerdictInput): Promise<void>;
+
   // Versions
   createVersion(slug: string): Promise<PageVersion>;
   getVersions(slug: string): Promise<PageVersion[]>;
@@ -207,4 +304,63 @@ export interface BrainEngine {
 
   // Raw SQL (for Minions job queue and other internal modules)
   executeRaw<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]>;
+
+  // ============================================================
+  // v0.20.0 Cathedral II: code edges (Layer 5 populates, Layer 7 consumes)
+  // ============================================================
+  /**
+   * Bulk-insert code edges. Resolved edges (to_chunk_id set) land in
+   * code_edges_chunk; unresolved refs (to_chunk_id null, to_symbol_qualified
+   * set) land in code_edges_symbol. ON CONFLICT DO NOTHING handles idempotency.
+   * Returns count of rows actually inserted.
+   */
+  addCodeEdges(edges: CodeEdgeInput[]): Promise<number>;
+
+  /**
+   * Delete all code edges involving these chunk IDs, in BOTH directions, across
+   * both code_edges_chunk and code_edges_symbol. Called by importCodeFile on
+   * per-chunk invalidation (codex SP-2): when a chunk's text changed, stale
+   * inbound edges from other pages pointing at the old symbol must wipe before
+   * new edges write.
+   */
+  deleteCodeEdgesForChunks(chunkIds: number[]): Promise<void>;
+
+  /**
+   * "Who calls this symbol?" Returns UNION of code_edges_chunk +
+   * code_edges_symbol matching `to_symbol_qualified = qualifiedName`.
+   * Source scoping (codex SP-3): if opts.sourceId is set, filter by the
+   * anchor chunk's source; if opts.allSources, ignore scoping.
+   */
+  getCallersOf(
+    qualifiedName: string,
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+  ): Promise<CodeEdgeResult[]>;
+
+  /**
+   * "What does this symbol call?" Returns edges from chunks whose
+   * from_symbol_qualified = qualifiedName. Same source-scoping semantics
+   * as getCallersOf.
+   */
+  getCalleesOf(
+    qualifiedName: string,
+    opts?: { sourceId?: string; allSources?: boolean; limit?: number },
+  ): Promise<CodeEdgeResult[]>;
+
+  /**
+   * All edges touching a chunk in the given direction. Used by A2 two-pass
+   * retrieval to expand from anchor chunks. direction='in' returns edges
+   * pointing AT the chunk; 'out' returns edges FROM it; 'both' unions.
+   */
+  getEdgesByChunk(
+    chunkId: number,
+    opts?: { direction?: 'in' | 'out' | 'both'; edgeType?: string; limit?: number },
+  ): Promise<CodeEdgeResult[]>;
+
+  /**
+   * Chunk-grain keyword search. Ranks by content_chunks.search_vector
+   * without the dedup-to-page pass that searchKeyword applies. Consumed
+   * by A2 two-pass retrieval as its anchor source. Most callers should
+   * prefer searchKeyword (external contract: page-grain best-chunk-per-page).
+   */
+  searchKeywordChunks(query: string, opts?: SearchOpts): Promise<SearchResult[]>;
 }

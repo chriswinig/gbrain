@@ -12,16 +12,28 @@ import * as os from 'node:os';
 
 let engine: PGLiteEngine;
 let queue: MinionQueue;
+// The shell handler at src/core/minions/handlers/shell.ts:210 throws
+// UnrecoverableError when GBRAIN_ALLOW_SHELL_JOBS !== '1'. That's the
+// production-worker RCE guard. Unit tests here exercise the handler
+// mechanics, not the guard, so we enable it for the whole file and
+// restore on teardown. The separate "rejects when env not set" case
+// (in the minion-shell submission E2E / the queue-resilience wave)
+// toggles the var itself.
+let prevAllowShellJobs: string | undefined;
 
 beforeAll(async () => {
+  prevAllowShellJobs = process.env.GBRAIN_ALLOW_SHELL_JOBS;
+  process.env.GBRAIN_ALLOW_SHELL_JOBS = '1';
   engine = new PGLiteEngine();
-  await engine.connect({ databaseUrl: '' });
+  await engine.connect({ database_url: '' });
   await engine.initSchema();
   queue = new MinionQueue(engine);
-});
+}, 60_000);
 
 afterAll(async () => {
   await engine.disconnect();
+  if (prevAllowShellJobs === undefined) delete process.env.GBRAIN_ALLOW_SHELL_JOBS;
+  else process.env.GBRAIN_ALLOW_SHELL_JOBS = prevAllowShellJobs;
 });
 
 beforeEach(async () => {

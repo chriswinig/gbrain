@@ -14,6 +14,8 @@ import { readFileSync, writeFileSync, readdirSync, lstatSync, existsSync } from 
 import { join, relative, basename } from 'path';
 import { buildPageResolver, resolvedEntityRefs, type ResolvedLinkTarget } from '../core/link-extraction.ts';
 import { parseMarkdown } from '../core/markdown.ts';
+import { createProgress, startHeartbeat } from '../core/progress.ts';
+import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 
 interface BacklinkGap {
   /** The page that mentions the entity */
@@ -217,7 +219,18 @@ export async function runBacklinksCore(opts: BacklinksOpts): Promise<BacklinksRe
     throw new Error(`Directory not found: ${opts.dir}`);
   }
 
-  const gaps = findBacklinkGaps(opts.dir);
+  // findBacklinkGaps is a sync double-walk of the brain dir. On 50K-page
+  // brains that can take seconds — heartbeat so agents see we're working.
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  progress.start('backlinks.scan');
+  const stopHb = startHeartbeat(progress, 'walking pages for missing back-links…');
+  let gaps: BacklinkGap[];
+  try {
+    gaps = findBacklinkGaps(opts.dir);
+  } finally {
+    stopHb();
+    progress.finish();
+  }
   const pagesAffected = new Set(gaps.map(g => g.targetPage)).size;
 
   if (opts.action === 'fix' && gaps.length > 0) {

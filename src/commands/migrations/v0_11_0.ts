@@ -23,8 +23,10 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, lstatSync, statSync, realpathSync } from 'fs';
 import { join, resolve, dirname } from 'path';
 import { execSync } from 'child_process';
+import { childGlobalFlags } from '../../core/cli-options.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { savePreferences, loadPreferences, appendCompletedMigration } from '../../core/preferences.ts';
+import { savePreferences, loadPreferences } from '../../core/preferences.ts';
+// Bug 3 — appendCompletedMigration moved to the runner (apply-migrations.ts).
 import { promptLine } from '../../core/cli-util.ts';
 import { VERSION } from '../../version.ts';
 
@@ -59,7 +61,7 @@ export interface PendingHostWorkEntry {
 function phaseASchema(opts: OrchestratorOpts): OrchestratorPhaseResult {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    execSync('gbrain init --migrate-only', { stdio: 'inherit', timeout: 60_000, env: process.env });
+    execSync('gbrain init --migrate-only' + childGlobalFlags(), { stdio: 'inherit', timeout: 60_000, env: process.env });
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -441,22 +443,11 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   const f = phaseFInstall(opts);
   phases.push(f);
 
-  // Phase G: record in completed.jsonl. Status depends on whether any
-  // host work remains pending AND whether the install phase succeeded.
+  // Bug 3 — Phase G (record in completed.jsonl) moved to the runner. The
+  // runner in apply-migrations.ts persists the result after orchestrator
+  // returns, so we just decide the status here.
   const status: 'complete' | 'partial' = (pending_host_work > 0) ? 'partial' : 'complete';
-
-  if (!opts.dryRun) {
-    appendCompletedMigration({
-      version: '0.11.0',
-      status,
-      mode,
-      files_rewritten,
-      autopilot_installed: f.status === 'complete',
-      install_target: undefined, // install target is decided inside autopilot --install
-      ...(status === 'partial' ? { apply_migrations_pending: true } : {}),
-    });
-  }
-  phases.push({ name: 'record', status: opts.dryRun ? 'skipped' : 'complete', detail: `status=${status}` });
+  phases.push({ name: 'record', status: opts.dryRun ? 'skipped' : 'complete', detail: `status=${status} (ledger write in runner)` });
 
   // Post-run: print pending-host-work summary if anything needs host action.
   if (pending_host_work > 0) {

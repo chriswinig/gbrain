@@ -44,35 +44,52 @@ function logError(phase: string, e: unknown) {
 /**
  * Resolve the gbrain CLI entrypoint for spawning the worker child.
  *
- * Codex caught the bug in earlier plan drafts: `process.execPath` is the
- * Bun (or Node) runtime binary on source installs, not `gbrain`. Blindly
- * using it would spawn `bun jobs work`, which does not work.
+ * A .ts source path is never a valid spawn target — spawning it fails with
+ * EACCES because TypeScript source isn't executable. The canonical install
+ * puts a shim at `/usr/local/bin/gbrain` (or wherever `which gbrain`
+ * resolves to) that already wraps the right runtime+entrypoint; prefer it.
  *
  * Order of resolution:
- *   1. argv[1] if it clearly points at a gbrain entry (cli.ts or /gbrain).
- *   2. process.execPath when running as the compiled binary.
- *   3. `which gbrain` for installs where the binary is on $PATH.
- *   4. Throw — nothing on $PATH, no way to supervise the worker.
+ *   1. `which gbrain` — the shim on PATH, canonical for installed builds.
+ *   2. process.execPath if it ends with /gbrain (compiled binary, no shim).
+ *   3. argv[1] if it ends with /gbrain (e.g., direct invocation of compiled
+ *      binary without PATH). Never .ts source paths.
+ *   4. Throw with a clear install hint.
  */
 export function resolveGbrainCliPath(): string {
-  const arg1 = process.argv[1] ?? '';
-  if (arg1.endsWith('/gbrain') || arg1.endsWith('/cli.ts') || arg1.endsWith('\\gbrain.exe')) {
-    return arg1;
-  }
+  try {
+    const which = execSync('which gbrain', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (which) return which;
+  } catch { /* not on $PATH — fall through */ }
+
   const exec = process.execPath ?? '';
   if (exec.endsWith('/gbrain') || exec.endsWith('\\gbrain.exe')) {
     return exec;
   }
-  try {
-    const which = execSync('which gbrain', { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    if (which) return which;
-  } catch { /* not on $PATH */ }
-  throw new Error('Could not resolve the gbrain CLI path. Install gbrain so it is on $PATH, or run autopilot from the compiled binary directly.');
+
+  const arg1 = process.argv[1] ?? '';
+  if (arg1.endsWith('/gbrain') || arg1.endsWith('\\gbrain.exe')) {
+    return arg1;
+  }
+
+  throw new Error('Could not resolve the gbrain CLI path. Install gbrain so it is on $PATH (e.g. /usr/local/bin/gbrain), or run autopilot from the compiled binary directly.');
+}
+
+export function shouldSpawnAutopilotWorker(args: string[]): boolean {
+  return !args.includes('--no-worker');
 }
 
 export async function runAutopilot(engine: BrainEngine, args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain autopilot [--repo <path>] [--interval N] [--json]\n       gbrain autopilot --install [--repo <path>]\n       gbrain autopilot --uninstall\n       gbrain autopilot --status [--json]\n\nSelf-maintaining brain daemon. Runs sync + extract + embed + backlinks in a loop.');
+    console.log(
+      'Usage: gbrain autopilot [--repo <path>] [--interval N] [--json] [--no-worker]\n' +
+      '       gbrain autopilot --install [--repo <path>]\n' +
+      '       gbrain autopilot --uninstall\n' +
+      '       gbrain autopilot --status [--json]\n\n' +
+      'Self-maintaining brain daemon. Runs the full maintenance cycle\n' +
+      '(lint + backlinks + sync + extract + embed + orphans) on an interval.\n\n' +
+      'For a one-shot cron-triggered cycle, see `gbrain dream`.',
+    );
     return;
   }
 
@@ -93,6 +110,7 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const baseInterval = parseInt(parseArg(args, '--interval') || '300', 10);
   const jsonMode = args.includes('--json');
   const forceInline = args.includes('--inline');
+  const noWorker = !shouldSpawnAutopilotWorker(args);
 
   if (!repoPath) {
     console.error('No repo path. Use --repo or run gbrain sync --repo first.');
@@ -124,34 +142,57 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   const cfg = loadConfig();
   const engineType = cfg?.engine ?? 'pglite';
   const useMinionsDispatch = mode !== 'off' && engineType === 'postgres' && !forceInline;
+  const spawnManagedWorker = useMinionsDispatch && !noWorker;
 
   let stopping = false;
   let workerProc: ChildProcess | null = null;
   let crashCount = 0;
+  let lastWorkerStartTime = 0;
 
-  if (useMinionsDispatch) {
+  // Stable-run reset window (matches MinionSupervisor.ts:471-476 pattern). If the
+  // worker ran > 5min before exit, treat as a fresh cycle (crashCount=1) so the
+  // RSS watchdog firing hourly does NOT trip autopilot's give-up threshold after
+  // ~5 hours of healthy uptime.
+  const STABLE_RUN_RESET_MS = 5 * 60 * 1000;
+
+  if (spawnManagedWorker) {
     const cliPath = resolveGbrainCliPath();
     const startWorker = () => {
-      const child = spawn(cliPath, ['jobs', 'work'], { stdio: 'inherit', env: process.env });
+      // Inject the RSS watchdog default (2048 MB) for the autopilot-supervised
+      // worker. Bare `gbrain jobs work` has no default; the supervisor and
+      // autopilot are the production paths that opt in.
+      const args = ['jobs', 'work', '--max-rss', '2048'];
+      const child = spawn(cliPath, args, { stdio: 'inherit', env: process.env });
       workerProc = child;
-      console.log(`[autopilot] Minions worker spawned (pid: ${child.pid})`);
+      lastWorkerStartTime = Date.now();
+      console.log(`[autopilot] Minions worker spawned (pid: ${child.pid}, watchdog: 2048MB)`);
       child.on('exit', (code) => {
         workerProc = null;
         if (stopping) return;
+        const runDuration = Date.now() - lastWorkerStartTime;
+        if (runDuration > STABLE_RUN_RESET_MS) {
+          // Stable run — forgive prior crash history. A watchdog-driven hourly
+          // exit (the production path post-fix) lands here every time.
+          crashCount = 1;
+        } else {
+          crashCount++;
+        }
         if (crashCount >= 5) {
-          console.error('[autopilot] 5 consecutive worker crashes, giving up.');
+          console.error(`[autopilot] 5 consecutive worker crashes (run ${runDuration}ms), giving up.`);
           process.exit(1);
         }
-        crashCount++;
-        console.error(`[autopilot] worker exited code=${code}, restart #${crashCount} in 10s`);
+        console.error(`[autopilot] worker exited code=${code} after ${runDuration}ms, restart #${crashCount} in 10s`);
         setTimeout(startWorker, 10_000);
       });
     };
     startWorker();
-  } else {
-    const why = mode === 'off' ? 'minion_mode=off'
+  } else if (!useMinionsDispatch) {
+    const why = mode === 'off'
+      ? 'minion_mode=off'
       : (engineType !== 'postgres' ? 'engine=pglite' : 'flag=--inline');
     console.log(`[autopilot] running steps inline (${why})`);
+  } else {
+    console.log('[autopilot] --no-worker set: dispatch loop only (worker managed externally)');
   }
 
   // Async shutdown with 35s drain window for the worker child. The worker
@@ -182,6 +223,18 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
   process.on('SIGINT',  () => { void shutdown('SIGINT'); });
 
   let consecutiveErrors = 0;
+  // Peer-worker liveness for --no-worker mode. The probe is a proxy, not
+  // ground truth: SELECT count(*) of active jobs with a recent lock_until
+  // refresh. A queue with only waiting jobs and a healthy idle worker
+  // reads as "no worker" (false positive); a worker that died 110s ago
+  // while holding a lock reads as "alive" until lock_until expires.
+  // Good enough for V1 — a ground-truth minion_workers heartbeat table
+  // is tracked as v0.19.1 follow-up B7. When the probe sees no signal
+  // for NO_WORKER_WARN_TICKS consecutive cycles, log a loud warning so
+  // the operator can spot "I set --no-worker but forgot to start one"
+  // before the queue piles up.
+  const NO_WORKER_WARN_TICKS = 3;
+  let noWorkerConsecutiveIdle = 0;
 
   while (!stopping) {
     const cycleStart = Date.now();
@@ -199,6 +252,43 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         await engine.disconnect();
         await (engine as any).connect?.();
       } catch (e) { logError('reconnect', e); }
+    }
+
+    // --no-worker peer-liveness probe (v0.19.1). Runs every cycle, cheap
+    // (single SELECT). See NO_WORKER_WARN_TICKS comment above for caveats.
+    if (noWorker && useMinionsDispatch) {
+      try {
+        const rows = await (engine as any).executeRaw?.(
+          `SELECT count(*)::int AS n FROM minion_jobs
+             WHERE status = 'active'
+               AND lock_until IS NOT NULL
+               AND lock_until > now() - interval '2 minutes'`,
+        );
+        const liveWorkerSignal = Number((rows as Array<{ n: number }>)?.[0]?.n ?? 0);
+        if (liveWorkerSignal === 0) {
+          noWorkerConsecutiveIdle++;
+          if (noWorkerConsecutiveIdle === NO_WORKER_WARN_TICKS) {
+            // Fire loud on the Nth consecutive idle tick; don't repeat on every
+            // subsequent cycle (the operator already saw it), re-arm once a
+            // live worker is seen again.
+            console.error(
+              `[autopilot] WARNING: --no-worker set and no worker has claimed a job in ~${NO_WORKER_WARN_TICKS * baseInterval}s. ` +
+              `Jobs will pile up in 'waiting' until a worker starts. ` +
+              `Probe is a proxy (lock_until refresh) and can false-positive on idle queues — see B7 for ground-truth follow-up.`,
+            );
+          }
+        } else {
+          if (noWorkerConsecutiveIdle >= NO_WORKER_WARN_TICKS) {
+            console.log('[autopilot] --no-worker probe: live worker signal detected; warning re-armed.');
+          }
+          noWorkerConsecutiveIdle = 0;
+        }
+      } catch (e) {
+        // Probe failures never block the main dispatch loop. Log once per
+        // failure class; ignore repeated errors (common shape: DB reconnect
+        // blip between ticks).
+        logError('no-worker-probe', e);
+      }
     }
 
     if (useMinionsDispatch) {
@@ -219,6 +309,12 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
             idempotency_key: `autopilot-cycle:${slot}`,
             max_attempts: 2,
             timeout_ms: timeoutMs,
+            // Submission backpressure: when the worker is dead or wedged,
+            // idempotency_key only dedupes within a slot; cross-slot pile-up
+            // is what produced the 28+ waiting-jobs production incident.
+            // maxWaiting: 1 caps at 1 active + 1 waiting; queue.add coalesces
+            // the 3rd+ submission and writes a backpressure-audit JSONL line.
+            maxWaiting: 1,
           },
         );
         if (jsonMode) {
@@ -228,27 +324,32 @@ export async function runAutopilot(engine: BrainEngine, args: string[]) {
         }
       } catch (e) { logError('dispatch', e); cycleOk = false; }
     } else {
-      // Inline fallback — same as pre-v0.11.1 behavior.
-      // 1. Sync
+      // Inline fallback — delegate to runCycle so lint + backlinks +
+      // orphan sweep run too (previously this path only did sync +
+      // extract + embed, which didn't match the Minions-dispatch
+      // path's phase set). Now both converge on the same primitive.
       try {
-        const { performSync } = await import('./sync.ts');
-        const result = await performSync(engine, { repoPath, noEmbed: true });
-        if (result.status === 'synced') {
-          console.log(`[sync] +${result.added} ~${result.modified} -${result.deleted}`);
+        const { runCycle } = await import('../core/cycle.ts');
+        const report = await runCycle(engine, {
+          brainDir: repoPath,
+          // Autopilot daemon path: pulls by default (matches
+          // pre-v0.17 autopilot behavior). CLI dream defaults false
+          // for cron safety; that choice is scoped to dream only.
+          pull: true,
+          yieldBetweenPhases: async () => {
+            await new Promise(r => setImmediate(r));
+          },
+        });
+        if (report.status === 'failed' || report.status === 'partial') {
+          cycleOk = false;
         }
-      } catch (e) { logError('sync', e); cycleOk = false; }
-
-      // 2. Extract (full brain, incremental dedup handles repeats)
-      try {
-        const { runExtractCore } = await import('./extract.ts');
-        await runExtractCore(engine, { mode: 'all', dir: repoPath });
-      } catch (e) { logError('extract', e); cycleOk = false; }
-
-      // 3. Embed stale
-      try {
-        const { runEmbedCore } = await import('./embed.ts');
-        await runEmbedCore(engine, { stale: true });
-      } catch (e) { logError('embed', e); cycleOk = false; }
+        if (jsonMode) {
+          process.stderr.write(JSON.stringify({ event: 'cycle-inline', status: report.status, duration_ms: report.duration_ms, totals: report.totals }) + '\n');
+        } else {
+          const t = report.totals;
+          console.log(`[cycle-inline ${report.status}] lint=${t.lint_fixes} backlinks=${t.backlinks_added} synced=${t.pages_synced} extracted=${t.pages_extracted} embedded=${t.pages_embedded} orphans=${t.orphans_found}`);
+        }
+      } catch (e) { logError('cycle-inline', e); cycleOk = false; }
     }
 
     // 4. Health check + adaptive interval (same for both paths)

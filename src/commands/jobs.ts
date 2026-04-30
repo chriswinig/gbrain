@@ -17,6 +17,68 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+/** Parse `--max-waiting N` from CLI args. Returns undefined if absent.
+ *  Throws on malformed input (caller should surface the error and exit).
+ *  Clamps to [1, 100] to match the queue-layer clamp in MinionQueue.add.
+ *  Exported for unit tests; the CLI handler at `jobs submit` wraps this
+ *  with process.exit(1) on throw so operators see 'must be positive integer'. */
+export function parseMaxWaitingFlag(args: string[]): number | undefined {
+  const raw = parseFlag(args, '--max-waiting');
+  if (raw === undefined) return undefined;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    throw new Error('--max-waiting must be a positive integer (will be clamped to [1, 100])');
+  }
+  return Math.max(1, Math.min(100, parsed));
+}
+
+/** Parse `--max-rss N` (MB). Returns:
+ *  - undefined if the flag is absent (caller decides the default)
+ *  - 0 if `--max-rss 0` (explicit disable)
+ *  - the value if >= 256
+ *  Errors and exits the process if the flag is non-numeric, negative, or
+ *  positive but < 256 (likely a GB-vs-MB unit-confusion typo). */
+export function parseMaxRssFlag(args: string[]): number | undefined {
+  const raw = parseFlag(args, '--max-rss');
+  if (raw === undefined) return undefined;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    console.error(`Error: --max-rss must be a non-negative integer (MB), got "${raw}"`);
+    process.exit(1);
+  }
+  if (parsed === 0) return 0;
+  if (parsed < 256) {
+    console.error(
+      `Error: --max-rss ${parsed} is too low for production (likely a unit confusion: ` +
+      `--max-rss takes megabytes, not gigabytes). Use --max-rss 0 to disable, ` +
+      `or set a value >= 256.`
+    );
+    process.exit(1);
+  }
+  return parsed;
+}
+
+export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv = process.env): number {
+  const raw = parseFlag(args, '--concurrency') ?? env.GBRAIN_WORKER_CONCURRENCY ?? '1';
+  const parsed = parseInt(raw, 10);
+  // Without validation, NaN / 0 / negative values flow through to the worker
+  // loop where `inFlight.size < concurrency` is always false → the worker
+  // claims zero jobs and the queue silently wedges. One typo in a systemd
+  // unit reproduces the original production incident. Clamp to ≥1 and surface
+  // the misconfig loudly so operators see it at worker startup.
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    const source = parseFlag(args, '--concurrency') !== undefined
+      ? '--concurrency flag'
+      : 'GBRAIN_WORKER_CONCURRENCY env';
+    process.stderr.write(
+      `[gbrain jobs] invalid concurrency from ${source} (${JSON.stringify(raw)}); ` +
+      `falling back to 1. Set a positive integer.\n`
+    );
+    return 1;
+  }
+  return parsed;
+}
+
 function formatJob(job: MinionJob): string {
   const dur = job.finished_at && job.started_at
     ? `${((job.finished_at.getTime() - job.started_at.getTime()) / 1000).toFixed(1)}s`
@@ -57,8 +119,11 @@ export async function runJobs(engine: BrainEngine, args: string[]): Promise<void
 
 USAGE
   gbrain jobs submit <name> [--params JSON] [--follow] [--priority N]
-                            [--delay Nms] [--timeout-ms Nms] [--max-attempts N]
-                            [--queue Q] [--dry-run]
+                            [--delay Nms] [--max-attempts N] [--max-stalled N]
+                            [--max-waiting N]
+                            [--backoff-type fixed|exponential] [--backoff-delay Nms]
+                            [--backoff-jitter 0..1] [--timeout-ms Nms]
+                            [--idempotency-key K] [--queue Q] [--dry-run]
   gbrain jobs list [--status S] [--queue Q] [--limit N]
   gbrain jobs get <id>
   gbrain jobs cancel <id>
@@ -67,7 +132,45 @@ USAGE
   gbrain jobs delete <id>
   gbrain jobs stats
   gbrain jobs smoke
-  gbrain jobs work [--queue Q] [--concurrency N]
+  gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
+                   [--health-interval MS]
+  gbrain jobs supervisor [start] [--detach] [--json]
+                         [--concurrency N] [--queue Q] [--pid-file PATH]
+                         [--max-crashes N] [--health-interval N]
+                         [--allow-shell-jobs] [--cli-path PATH]
+                         [--max-rss MB]
+  gbrain jobs supervisor status [--json] [--pid-file PATH]
+  gbrain jobs supervisor stop [--json] [--pid-file PATH]
+
+    Auto-restarting wrapper around 'gbrain jobs work'. Spawns the worker
+    as a child process and restarts on crash with exponential backoff
+    (1s -> 60s cap). Writes a PID file to ~/.gbrain/supervisor.pid by
+    default (override via --pid-file or GBRAIN_SUPERVISOR_PID_FILE env).
+    Lifecycle events are appended to
+      \${GBRAIN_AUDIT_DIR:-~/.gbrain/audit}/supervisor-YYYY-Www.jsonl
+
+    SUBCOMMANDS
+      start        (default) Launch the supervisor. --detach returns a
+                   JSON {event, supervisor_pid, pid_file} payload on
+                   stdout and forks; omit for foreground.
+      status       Read PID file + audit log, report running / last_start
+                   / crashes_24h / max_crashes_exceeded as JSON or human.
+                   Exits 0 if running, 1 if not.
+      stop         Send SIGTERM to the supervisor, wait up to 40s for
+                   graceful drain, report outcome. Exits 0 on clean stop.
+
+    EXIT CODES (start)
+      0  clean shutdown (SIGTERM/SIGINT received, worker drained)
+      1  max crashes exceeded (worker kept dying)
+      2  another supervisor holds the PID lock
+      3  PID file unwritable (permission / path error)
+
+    EXAMPLES
+      gbrain jobs supervisor --concurrency 4         # foreground (Ctrl-C stops)
+      gbrain jobs supervisor start --detach --json   # agent-friendly: fork + return JSON
+      gbrain jobs supervisor status --json           # machine-readable health check
+      gbrain jobs supervisor stop                    # graceful stop
+      gbrain jobs supervisor --json --allow-shell-jobs  # JSONL events + shell-exec on
 
 HANDLER TYPES (built in)
   sync              Pull and embed new pages from the repo
@@ -104,13 +207,32 @@ HANDLER TYPES (built in)
       const priority = parseInt(parseFlag(args, '--priority') ?? '0', 10);
       const delay = parseInt(parseFlag(args, '--delay') ?? '0', 10);
       const maxAttempts = parseInt(parseFlag(args, '--max-attempts') ?? '3', 10);
-      const queueName = parseFlag(args, '--queue') ?? 'default';
+      const maxStalledRaw = parseFlag(args, '--max-stalled');
+      const maxStalled = maxStalledRaw !== undefined ? parseInt(maxStalledRaw, 10) : undefined;
+      // --max-waiting N: submission-time backpressure cap. Mirrors --max-stalled
+      // clamp [1, 100]. Feature is usable from CLI as of v0.19.1; pre-v0.19.1
+      // only programmatic callers reached it.
+      let maxWaiting: number | undefined;
+      try { maxWaiting = parseMaxWaitingFlag(args); }
+      catch (e) { console.error(`Error: ${e instanceof Error ? e.message : String(e)}`); process.exit(1); }
+      // v0.13.1 field audit: expose retry/backoff/timeout/idempotency knobs so
+      // users can tune Minions behavior without dropping into TypeScript.
+      const backoffTypeRaw = parseFlag(args, '--backoff-type');
+      const backoffType = backoffTypeRaw === 'fixed' || backoffTypeRaw === 'exponential'
+        ? backoffTypeRaw
+        : undefined;
+      const backoffDelayRaw = parseFlag(args, '--backoff-delay');
+      const backoffDelay = backoffDelayRaw !== undefined ? parseInt(backoffDelayRaw, 10) : undefined;
+      const backoffJitterRaw = parseFlag(args, '--backoff-jitter');
+      const backoffJitter = backoffJitterRaw !== undefined ? parseFloat(backoffJitterRaw) : undefined;
       const timeoutMsRaw = parseFlag(args, '--timeout-ms');
       const timeoutMs = timeoutMsRaw !== undefined ? parseInt(timeoutMsRaw, 10) : undefined;
       if (timeoutMsRaw !== undefined && (isNaN(timeoutMs!) || timeoutMs! <= 0)) {
         console.error('Error: --timeout-ms must be a positive integer (milliseconds)');
         process.exit(1);
       }
+      const idempotencyKey = parseFlag(args, '--idempotency-key');
+      const queueName = parseFlag(args, '--queue') ?? 'default';
       const dryRun = hasFlag(args, '--dry-run');
       const follow = hasFlag(args, '--follow');
 
@@ -120,8 +242,14 @@ HANDLER TYPES (built in)
         console.log(`  Queue: ${queueName}`);
         console.log(`  Priority: ${priority}`);
         console.log(`  Max attempts: ${maxAttempts}`);
+        if (maxStalled !== undefined) console.log(`  Max stalled: ${maxStalled}`);
+        if (maxWaiting !== undefined) console.log(`  Max waiting: ${maxWaiting}`);
+        if (backoffType) console.log(`  Backoff type: ${backoffType}`);
+        if (backoffDelay !== undefined) console.log(`  Backoff delay: ${backoffDelay}ms`);
+        if (backoffJitter !== undefined) console.log(`  Backoff jitter: ${backoffJitter}`);
+        if (timeoutMs !== undefined) console.log(`  Timeout: ${timeoutMs}ms`);
+        if (idempotencyKey) console.log(`  Idempotency key: ${idempotencyKey}`);
         if (delay > 0) console.log(`  Delay: ${delay}ms`);
-        if (timeoutMs) console.log(`  Timeout: ${timeoutMs}ms`);
         console.log(`  Data: ${JSON.stringify(data)}`);
         return;
       }
@@ -142,8 +270,14 @@ HANDLER TYPES (built in)
         priority,
         delay: delay > 0 ? delay : undefined,
         max_attempts: maxAttempts,
-        queue: queueName,
+        max_stalled: maxStalled,
+        maxWaiting,
+        backoff_type: backoffType,
+        backoff_delay: backoffDelay,
+        backoff_jitter: backoffJitter,
         timeout_ms: timeoutMs,
+        idempotency_key: idempotencyKey,
+        queue: queueName,
       }, trusted);
 
       // Submission audit log (operational trace, not forensic insurance).
@@ -181,8 +315,15 @@ HANDLER TYPES (built in)
 
       if (follow) {
         console.log(`Job #${job.id} submitted (${name}). Executing inline...`);
-        // Inline execution: run the job in this process
-        const worker = new MinionWorker(engine, { queue: queueName, pollInterval: 100 });
+        // Inline execution: run the job in this process. Disable the
+        // self-health-check timer — inline flows are one-shot and don't have
+        // a process manager to restart them. With the timer enabled and no
+        // 'unhealthy' listener, a DB blip would trip emitUnhealthy's
+        // no-listener fallback and call process.exit(1) from inside the
+        // library, killing the user's CLI session.
+        const worker = new MinionWorker(engine, {
+          queue: queueName, pollInterval: 100, healthCheckInterval: 0,
+        });
 
         // Register built-in handlers
         await registerBuiltinHandlers(worker, engine);
@@ -353,7 +494,14 @@ HANDLER TYPES (built in)
         process.exit(1);
       }
 
-      const worker = new MinionWorker(engine, { queue: 'smoke', pollInterval: 100 });
+      const sigkillRescue = hasFlag(args, '--sigkill-rescue');
+      const wedgeRescue = hasFlag(args, '--wedge-rescue');
+
+      // Smoke harness is short-lived and has no listener — disable the health
+      // timer so the no-listener fallback can't trip process.exit(1) mid-test.
+      const worker = new MinionWorker(engine, {
+        queue: 'smoke', pollInterval: 100, healthCheckInterval: 0,
+      });
       worker.register('noop', async () => ({ ok: true, at: new Date().toISOString() }));
 
       const job = await queue.add('noop', {}, { queue: 'smoke', max_attempts: 1 });
@@ -370,22 +518,125 @@ HANDLER TYPES (built in)
       await workerPromise;
 
       const elapsedSec = ((Date.now() - startTime) / 1000).toFixed(2);
-      if (final?.status === 'completed') {
-        const cfg = (await import('../core/config.ts')).loadConfig();
-        const engineLabel = cfg?.engine ?? 'unknown';
-        console.log(`SMOKE PASS — Minions healthy in ${elapsedSec}s (engine: ${engineLabel})`);
-        if (engineLabel === 'pglite') {
-          console.log('Note: the `gbrain jobs work` daemon requires Postgres. PGLite');
-          console.log('supports inline execution only (`submit --follow`).');
-        }
-        try { await queue.removeJob(job.id); } catch { /* non-fatal cleanup */ }
-        process.exit(0);
-      } else {
+      if (final?.status !== 'completed') {
         console.error(`SMOKE FAIL — job #${job.id} status: ${final?.status ?? 'timeout'} (${elapsedSec}s elapsed)`);
         if (final?.error_text) console.error(`  Error: ${final.error_text}`);
         process.exit(1);
       }
-      break;
+
+      // --sigkill-rescue: regression case for #219. Simulates a SIGKILL
+      // mid-flight by directly manipulating lock_until via handleStalled.
+      // Verifies that with the v0.13.1 schema default (max_stalled=5), a
+      // stalled job is REQUEUED rather than dead-lettered on first stall.
+      // Full subprocess-level SIGKILL lives in test/e2e/minions.test.ts.
+      if (sigkillRescue) {
+        const rescueJob = await queue.add('noop', {}, { queue: 'smoke' });
+
+        // Transition to active with a past lock_until, mimicking a worker
+        // that claimed and then got SIGKILL'd mid-run.
+        await engine.executeRaw(
+          `UPDATE minion_jobs
+              SET status='active',
+                  lock_token='smoke-sigkill-rescue',
+                  lock_until=now() - interval '1 minute',
+                  started_at=now() - interval '2 minute',
+                  attempts_started = attempts_started + 1
+            WHERE id=$1`,
+          [rescueJob.id]
+        );
+
+        const result = await queue.handleStalled();
+        const afterStall = await queue.getJob(rescueJob.id);
+
+        if (afterStall?.status === 'dead') {
+          console.error(
+            `SMOKE FAIL (--sigkill-rescue) — job #${rescueJob.id} was dead-lettered on first stall. ` +
+            `This is the #219 regression: schema default max_stalled should rescue, not dead-letter. ` +
+            `handleStalled: ${JSON.stringify(result)}`
+          );
+          process.exit(1);
+        }
+        if (afterStall?.status !== 'waiting') {
+          console.error(
+            `SMOKE FAIL (--sigkill-rescue) — unexpected status after stall: ${afterStall?.status}. ` +
+            `Expected 'waiting' (rescued). handleStalled: ${JSON.stringify(result)}`
+          );
+          process.exit(1);
+        }
+        try { await queue.removeJob(rescueJob.id); } catch { /* non-fatal cleanup */ }
+      }
+
+      // --wedge-rescue: regression case for the v0.19.1 production incident.
+      // In prod, a wedged worker held a row lock via a pending txn. The
+      // lock-renewal UPDATE blocked, lock_until fell below now(), handleStalled
+      // saw the candidate but FOR UPDATE SKIP LOCKED skipped (row lock held),
+      // handleTimeouts was disqualified (lock_until > now() fails).
+      // Only handleWallClockTimeouts' no-constraint sweep evicted.
+      //
+      // The smoke is single-connection, so we can't simulate a row lock held
+      // by another txn. Instead we forge the state where BOTH handleStalled
+      // and handleTimeouts are disqualified so only wall-clock fires:
+      //   - lock_until far in the future → handleStalled skips (not a stall)
+      //   - timeout_at = NULL → handleTimeouts skips (needs NOT NULL)
+      //   - started_at 10s ago with timeout_ms=1000 → wall-clock matches
+      //     (2 × timeout_ms = 2000ms threshold exceeded)
+      if (wedgeRescue) {
+        const wedgedJob = await queue.add('noop', {}, {
+          queue: 'smoke',
+          timeout_ms: 1000,
+        });
+        await engine.executeRaw(
+          `UPDATE minion_jobs
+              SET status='active',
+                  lock_token='smoke-wedge-rescue',
+                  lock_until=now() + interval '30 seconds',
+                  started_at=now() - interval '10 seconds',
+                  timeout_at=NULL,
+                  attempts_started = attempts_started + 1
+            WHERE id=$1`,
+          [wedgedJob.id]
+        );
+
+        const stallResult = await queue.handleStalled();
+        const stalledStatus = await queue.getJob(wedgedJob.id);
+        const timeoutResult = await queue.handleTimeouts();
+        const timedStatus = await queue.getJob(wedgedJob.id);
+        const wallResult = await queue.handleWallClockTimeouts(30000);
+        const finalStatus = await queue.getJob(wedgedJob.id);
+
+        if (finalStatus?.status !== 'dead') {
+          console.error(
+            `SMOKE FAIL (--wedge-rescue) — wall-clock sweep did not evict job #${wedgedJob.id}. ` +
+            `Status: ${finalStatus?.status}. ` +
+            `handleStalled: requeued=${stallResult.requeued.length} dead=${stallResult.dead.length}, after: ${stalledStatus?.status}; ` +
+            `handleTimeouts: ${timeoutResult.length}, after: ${timedStatus?.status}; ` +
+            `handleWallClockTimeouts: ${wallResult.length}, final: ${finalStatus?.status}.`
+          );
+          process.exit(1);
+        }
+        if (finalStatus.error_text !== 'wall-clock timeout exceeded') {
+          console.error(
+            `SMOKE FAIL (--wedge-rescue) — dead, but error_text='${finalStatus.error_text}' ` +
+            `(expected 'wall-clock timeout exceeded').`
+          );
+          process.exit(1);
+        }
+        try { await queue.removeJob(wedgedJob.id); } catch { /* non-fatal cleanup */ }
+      }
+
+      const cfg = (await import('../core/config.ts')).loadConfig();
+      const engineLabel = cfg?.engine ?? 'unknown';
+      const tags: string[] = [];
+      if (sigkillRescue) tags.push('SIGKILL rescue');
+      if (wedgeRescue) tags.push('wedge rescue');
+      const tag = tags.length > 0 ? ` + ${tags.join(' + ')}` : '';
+      console.log(`SMOKE PASS — Minions healthy${tag} in ${elapsedSec}s (engine: ${engineLabel})`);
+      if (engineLabel === 'pglite') {
+        console.log('Note: the `gbrain jobs work` daemon requires Postgres. PGLite');
+        console.log('supports inline execution only (`submit --follow`).');
+      }
+      try { await queue.removeJob(job.id); } catch { /* non-fatal cleanup */ }
+      process.exit(0);
     }
 
     case 'work': {
@@ -398,17 +649,274 @@ HANDLER TYPES (built in)
       }
 
       const queueName = parseFlag(args, '--queue') ?? 'default';
-      const concurrency = parseInt(parseFlag(args, '--concurrency') ?? '1', 10);
+      const concurrency = resolveWorkerConcurrency(args);
+      // --max-rss defaults to 2048 for bare workers (matching supervisor default).
+      // This catches memory-leak stalls that previously went undetected without
+      // a supervisor. Operators can opt out with `--max-rss 0`.
+      const maxRssExplicit = parseMaxRssFlag(args);
+      const maxRssMb = maxRssExplicit ?? 2048;
+
+      // --health-interval: self-health-check period in ms. 0 disables. Default: 60_000 (60s).
+      // Provides DB liveness probes + stall detection for bare workers.
+      // Automatically skipped when running under a supervisor (GBRAIN_SUPERVISED=1).
+      // Validated aggressively (parity with --max-rss): reject NaN/negative/non-integer
+      // values, and reject suspicious sub-1000ms values that are likely a unit-confusion
+      // typo (e.g. "--health-interval 60" thinking the unit is seconds).
+      const healthRaw = parseFlag(args, '--health-interval');
+      let healthCheckInterval = 60_000;
+      if (healthRaw !== undefined) {
+        const parsed = parseInt(healthRaw, 10);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          console.error(`Error: --health-interval must be a non-negative integer (ms), got "${healthRaw}"`);
+          process.exit(1);
+        }
+        if (parsed > 0 && parsed < 1000) {
+          console.error(
+            `Error: --health-interval ${parsed} is suspiciously low (likely a unit-confusion typo). ` +
+            `The flag takes milliseconds; for 60-second probes pass 60000. Use 0 to disable.`,
+          );
+          process.exit(1);
+        }
+        healthCheckInterval = parsed;
+      }
 
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
-      const worker = new MinionWorker(engine, { queue: queueName, concurrency });
+      const worker = new MinionWorker(engine, {
+        queue: queueName, concurrency, maxRssMb, healthCheckInterval,
+      });
       await registerBuiltinHandlers(worker, engine);
 
-      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency})`);
+      // Subscribe to self-health failures emitted by the worker. Library code
+      // (worker.ts) never calls process.exit directly so it stays embeddable;
+      // this CLI layer is the right place to terminate the process and let
+      // the external PM (systemd, Docker, cron watchdog) restart cleanly.
+      worker.on('unhealthy', (info) => {
+        if (info.reason === 'db_dead') {
+          console.error(
+            `[health] FATAL: DB unreachable after ${info.consecutiveFailures} probes (${info.message}). ` +
+            `Exiting for process-manager restart.`,
+          );
+        } else {
+          console.error(
+            `[health] FATAL: Worker stalled — ${info.waitingCount} waiting job(s) for ` +
+            `registered handlers, ${info.idleMinutes}m idle. Exiting for process-manager restart.`,
+          );
+        }
+        process.exit(1);
+      });
+
+      const isSupervisedChild = process.env.GBRAIN_SUPERVISED === '1';
+      const watchdogNote = maxRssMb > 0 ? `, watchdog: ${maxRssMb}MB` : '';
+      const healthNote = !isSupervisedChild && healthCheckInterval > 0
+        ? `, health-check: ${Math.round(healthCheckInterval / 1000)}s`
+        : '';
+      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote})`);
       console.log(`Registered handlers: ${worker.registeredNames.join(', ')}`);
       await worker.start();
+      break;
+    }
+
+    case 'supervisor': {
+      // Dispatcher for supervisor subcommands:
+      //   gbrain jobs supervisor                    → foreground start (back-compat)
+      //   gbrain jobs supervisor start [--detach]   → foreground or detached start
+      //   gbrain jobs supervisor status             → JSON liveness + queue stats
+      //   gbrain jobs supervisor stop               → SIGTERM + drain wait
+      const { MinionSupervisor, DEFAULT_PID_FILE } = await import('../core/minions/supervisor.ts');
+      const { writeSupervisorEvent } = await import('../core/minions/handlers/supervisor-audit.ts');
+
+      const supCmd = args[1];
+      const isStatusCmd = supCmd === 'status';
+      const isStopCmd = supCmd === 'stop';
+      const isStartCmd = supCmd === 'start' || supCmd === undefined || supCmd === '--detach' ||
+                          (typeof supCmd === 'string' && supCmd.startsWith('--'));
+      const jsonMode = hasFlag(args, '--json');
+      const pidFile = parseFlag(args, '--pid-file') ?? DEFAULT_PID_FILE;
+
+      // ----- status subcommand -----
+      if (isStatusCmd) {
+        const { existsSync, readFileSync } = await import('fs');
+        const { readSupervisorEvents } = await import('../core/minions/handlers/supervisor-audit.ts');
+
+        let supervisorPid: number | null = null;
+        let running = false;
+        if (existsSync(pidFile)) {
+          try {
+            const line = readFileSync(pidFile, 'utf8').trim().split('\n')[0];
+            const parsed = parseInt(line, 10);
+            if (!isNaN(parsed) && parsed > 0) {
+              supervisorPid = parsed;
+              try { process.kill(parsed, 0); running = true; } catch { running = false; }
+            }
+          } catch { /* unreadable PID file */ }
+        }
+
+        const events = readSupervisorEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+        const lastStart = events.filter(e => e.event === 'started').pop()?.ts ?? null;
+        const crashes24h = events.filter(e => e.event === 'worker_exited').length;
+        const maxCrashesEvent = events.filter(e => e.event === 'max_crashes_exceeded').pop() ?? null;
+
+        const status = {
+          running,
+          supervisor_pid: supervisorPid,
+          pid_file: pidFile,
+          last_start: lastStart,
+          crashes_24h: crashes24h,
+          max_crashes_exceeded: !!maxCrashesEvent,
+        };
+
+        if (jsonMode) {
+          console.log(JSON.stringify(status, null, 2));
+        } else {
+          console.log(`Supervisor: ${running ? 'running' : 'not running'}`);
+          if (supervisorPid) console.log(`  PID:           ${supervisorPid}`);
+          console.log(`  PID file:      ${pidFile}`);
+          if (lastStart) console.log(`  Last start:    ${lastStart}`);
+          console.log(`  Crashes (24h): ${crashes24h}`);
+          if (maxCrashesEvent) console.log(`  ⚠ Max crashes exceeded at ${maxCrashesEvent.ts}`);
+        }
+        process.exit(running ? 0 : 1);
+      }
+
+      // ----- stop subcommand -----
+      if (isStopCmd) {
+        const { existsSync, readFileSync } = await import('fs');
+        if (!existsSync(pidFile)) {
+          const payload = { stopped: false, reason: 'pid_file_missing', pid_file: pidFile };
+          if (jsonMode) console.log(JSON.stringify(payload));
+          else console.error(`No PID file at ${pidFile}; supervisor not running.`);
+          process.exit(1);
+        }
+        let supervisorPid: number;
+        try {
+          supervisorPid = parseInt(readFileSync(pidFile, 'utf8').trim().split('\n')[0], 10);
+          if (isNaN(supervisorPid) || supervisorPid <= 0) throw new Error('invalid pid');
+        } catch (err) {
+          const payload = { stopped: false, reason: 'pid_file_corrupt', error: String(err) };
+          if (jsonMode) console.log(JSON.stringify(payload));
+          else console.error(`PID file corrupt: ${err}`);
+          process.exit(1);
+        }
+
+        try { process.kill(supervisorPid, 'SIGTERM'); }
+        catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          const payload = {
+            stopped: false,
+            reason: code === 'ESRCH' ? 'process_gone' : 'kill_failed',
+            supervisor_pid: supervisorPid,
+          };
+          if (jsonMode) console.log(JSON.stringify(payload));
+          else console.error(`Cannot signal PID ${supervisorPid}: ${err}`);
+          process.exit(code === 'ESRCH' ? 0 : 1);
+        }
+
+        // Poll for up to 40s (supervisor's own 35s drain + 5s slack).
+        const deadline = Date.now() + 40_000;
+        let stoppedCleanly = false;
+        while (Date.now() < deadline) {
+          try { process.kill(supervisorPid, 0); }
+          catch { stoppedCleanly = true; break; }
+          await new Promise(r => setTimeout(r, 250));
+        }
+
+        const payload = {
+          stopped: stoppedCleanly,
+          supervisor_pid: supervisorPid,
+          reason: stoppedCleanly ? 'drained' : 'timeout_40s',
+        };
+        if (jsonMode) console.log(JSON.stringify(payload));
+        else console.log(stoppedCleanly ? `Supervisor ${supervisorPid} stopped.` : `Supervisor ${supervisorPid} did not exit within 40s.`);
+        process.exit(stoppedCleanly ? 0 : 1);
+      }
+
+      // ----- start subcommand (default) -----
+      if (!isStartCmd) {
+        console.error(`Unknown supervisor subcommand: ${supCmd}. Expected: start, status, stop.`);
+        process.exit(1);
+      }
+
+      const config = (await import('../core/config.ts')).loadConfig();
+      if (config?.engine === 'pglite') {
+        console.error('Error: Supervisor requires Postgres. PGLite uses an exclusive file lock that blocks other processes.');
+        process.exit(1);
+      }
+
+      const { resolveGbrainCliPath } = await import('./autopilot.ts');
+
+      const concurrency = parseInt(parseFlag(args, '--concurrency') ?? '2', 10);
+      const queueName = parseFlag(args, '--queue') ?? 'default';
+      const maxCrashes = parseInt(parseFlag(args, '--max-crashes') ?? '10', 10);
+      // --health-interval (supervisor): validate same as `jobs work` so NaN /
+      // negative / sub-1000ms typos fail-fast instead of silently disabling
+      // the supervisor's own health probe.
+      const supHealthRaw = parseFlag(args, '--health-interval');
+      let healthInterval = 60_000;
+      if (supHealthRaw !== undefined) {
+        const parsed = parseInt(supHealthRaw, 10);
+        if (!Number.isFinite(parsed) || parsed < 0) {
+          console.error(`Error: --health-interval must be a non-negative integer (ms), got "${supHealthRaw}"`);
+          process.exit(1);
+        }
+        if (parsed > 0 && parsed < 1000) {
+          console.error(
+            `Error: --health-interval ${parsed} is suspiciously low (likely a unit-confusion typo). ` +
+            `The flag takes milliseconds; for 60-second probes pass 60000. Use 0 to disable.`,
+          );
+          process.exit(1);
+        }
+        healthInterval = parsed;
+      }
+      const allowShellJobs = hasFlag(args, '--allow-shell-jobs') ||
+                             !!process.env.GBRAIN_ALLOW_SHELL_JOBS;
+      const detach = hasFlag(args, '--detach');
+      // Supervisor defaults --max-rss 2048 (MB) — main production path uses
+      // the supervisor, so the watchdog is on by default here.
+      const maxRssMb = parseMaxRssFlag(args) ?? 2048;
+
+      const cliPath = parseFlag(args, '--cli-path') ?? resolveGbrainCliPath();
+
+      // --detach: fork a background supervisor, print PID payload, exit 0.
+      // Implementation: re-exec the same CLI as a detached child without --detach,
+      // inheriting stderr (so JSONL events still flow to the parent's tail-f
+      // if they wanted to follow logs) but detaching stdin/stdout.
+      if (detach) {
+        const { spawn } = await import('child_process');
+        const childArgs = process.argv.slice(2).filter(a => a !== '--detach');
+        const child = spawn(process.execPath, [process.argv[1], ...childArgs], {
+          detached: true,
+          stdio: ['ignore', 'ignore', 'inherit'],
+          env: process.env,
+        });
+        child.unref();
+        const payload = {
+          event: 'started',
+          supervisor_pid: child.pid,
+          pid_file: pidFile,
+          detached: true,
+        };
+        console.log(JSON.stringify(payload));
+        process.exit(0);
+      }
+
+      // Foreground start.
+      const supervisorPid = process.pid;
+      const supervisor = new MinionSupervisor(engine, {
+        concurrency,
+        queue: queueName,
+        pidFile,
+        maxCrashes,
+        healthInterval,
+        cliPath,
+        allowShellJobs,
+        json: jsonMode,
+        maxRssMb,
+        onEvent: (emission) => writeSupervisorEvent(emission, supervisorPid),
+      });
+
+      await supervisor.start();
       break;
     }
 
@@ -435,18 +943,59 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     const { performSync } = await import('./sync.ts');
     const repoPath = typeof job.data.repoPath === 'string' ? job.data.repoPath : undefined;
     const noPull = !!job.data.noPull;
+    // noEmbed defaults to true (embed is a separate job — submit `embed --stale`
+    // after sync, OR run via the autopilot cycle which has its own embed phase).
+    // Caller can opt in by passing { noEmbed: false } in job params.
     const noEmbed = job.data.noEmbed !== false;
-    const result = await performSync(engine, { repoPath, noPull, noEmbed });
+    // v0.22.13 (PR #490 CODEX-1): resolve sourceId from job param OR by looking
+    // up the sources row for repoPath. Mirrors cycle.ts:480 — without this, a
+    // multi-source brain reads the global config.sync.last_commit anchor
+    // instead of sources.last_commit, which on a regularly-GC'd repo can drop
+    // out of git history and trigger 30-min full reimports every cycle.
+    let sourceId: string | undefined =
+      typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    if (!sourceId && repoPath) {
+      try {
+        const rows = await engine.executeRaw<{ id: string }>(
+          `SELECT id FROM sources WHERE local_path = $1 LIMIT 1`,
+          [repoPath],
+        );
+        sourceId = rows[0]?.id;
+      } catch {
+        // sources table may not exist on very old brains — fall through to
+        // global config.sync.* anchor in performSync.
+      }
+    }
+    // v0.22.13 (PR #490 CODEX-4): route concurrency through the shared
+    // autoConcurrency helper instead of hardcoded 4. PGLite engines stay
+    // serial (forced 1); explicit job param wins; auto path defaults are
+    // applied inside performSync against the resolved file count.
+    const concurrencyOverride = typeof job.data.concurrency === 'number'
+      ? job.data.concurrency
+      : undefined;
+    const result = await performSync(engine, {
+      repoPath, sourceId, noPull, noEmbed,
+      concurrency: concurrencyOverride,
+    });
     return result;
   });
 
   worker.register('embed', async (job) => {
     const { runEmbedCore } = await import('./embed.ts');
+    // Primary Minion progress channel is job.updateProgress (DB-backed,
+    // readable via `gbrain jobs get <id>`). Stderr from the worker daemon
+    // only emits coarse job-start / job-done lines; per-page detail lives
+    // in the DB. Per Codex review #20.
     await runEmbedCore(engine, {
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
       all: !!job.data.all,
       stale: job.data.all ? false : (job.data.stale !== false),
+      onProgress: (done, total, embedded) => {
+        // Fire-and-forget: progress updates are best-effort and must not
+        // block the worker loop.
+        job.updateProgress({ done, total, embedded, phase: 'embed.pages' }).catch(() => {});
+      },
     });
     return { embedded: true };
   });
@@ -491,53 +1040,94 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     return await runBacklinksCore({ action, dir, dryRun: !!job.data.dryRun });
   });
 
-  // The killer handler. Autopilot submits ONE `autopilot-cycle` per cycle
-  // (idempotency_key on cycle slot) instead of a 4-job parent-child DAG,
-  // because Minions' parent/child is NOT a depends_on primitive (Codex
-  // H3/H4). Each step is wrapped in its own try/catch; the handler returns
-  // `{ partial: true, failed_steps: [...] }` when any step fails. It does
-  // NOT throw on partial failure — that would cause the Minion to retry,
-  // and an intermittent extract bug would block every future cycle.
+  // Autopilot-cycle handler: delegates to runCycle. Shares the exact same
+  // phase set and ordering as `gbrain dream` and autopilot's inline path —
+  // one source of truth for what the brain does overnight.
+  //
+  // Yields the event loop between phases so the worker's lock-renewal
+  // timer (src/core/minions/worker.ts) can fire. Without this the v0.14
+  // stall-death regression returns: long CPU-bound phases starve the
+  // renewal callback and the stalled-sweeper kills the job.
+  //
+  // Phase failures surface as report.status='partial' (via runCycle's
+  // derivation); the handler returns { partial, status, report } so
+  // `gbrain jobs get <id>` shows the full structured report. Does NOT
+  // throw on partial: a flaky phase must not block every future cycle.
   worker.register('autopilot-cycle', async (job) => {
-    const { performSync } = await import('./sync.ts');
-    const { runExtractCore } = await import('./extract.ts');
-    const { runEmbedCore } = await import('./embed.ts');
-    const { runBacklinksCore } = await import('./backlinks.ts');
-
+    const { runCycle } = await import('../core/cycle.ts');
     const repoPath = typeof job.data.repoPath === 'string'
       ? job.data.repoPath
       : (await engine.getConfig('sync.repo_path')) ?? '.';
 
-    const steps: Record<string, unknown> = {};
-    const failed: string[] = [];
+    // Allow callers to select phases via job data (e.g. skip embed for
+    // fast cycles). Validates against ALL_PHASES to prevent injection.
+    const { ALL_PHASES } = await import('../core/cycle.ts');
+    const validPhases = new Set(ALL_PHASES);
+    const requestedPhases = Array.isArray(job.data.phases)
+      ? (job.data.phases as string[]).filter(p => validPhases.has(p as any))
+      : undefined;
 
-    try { steps.sync = await performSync(engine, { repoPath, noEmbed: true }); }
-    catch (e) { steps.sync = { error: e instanceof Error ? e.message : String(e) }; failed.push('sync'); }
+    const report = await runCycle(engine, {
+      brainDir: repoPath,
+      pull: true, // autopilot daemon opts into git pull
+      signal: job.signal, // propagate abort so cycle bails on timeout/cancel
+      ...(requestedPhases && requestedPhases.length > 0 ? { phases: requestedPhases as any } : {}),
+      yieldBetweenPhases: async () => {
+        // Yield to the event loop so worker lock-renewal can fire.
+        await new Promise<void>(r => setImmediate(r));
+      },
+    });
 
-    try { steps.extract = await runExtractCore(engine, { mode: 'all', dir: repoPath }); }
-    catch (e) { steps.extract = { error: e instanceof Error ? e.message : String(e) }; failed.push('extract'); }
-
-    try { await runEmbedCore(engine, { stale: true }); steps.embed = { embedded: true }; }
-    catch (e) { steps.embed = { error: e instanceof Error ? e.message : String(e) }; failed.push('embed'); }
-
-    try { steps.backlinks = await runBacklinksCore({ action: 'fix', dir: repoPath }); }
-    catch (e) { steps.backlinks = { error: e instanceof Error ? e.message : String(e) }; failed.push('backlinks'); }
-
-    if (failed.length > 0) {
-      return { partial: true, failed_steps: failed, steps };
-    }
-    return { partial: false, steps };
+    return {
+      partial: report.status === 'partial' || report.status === 'failed',
+      status: report.status,
+      report,
+    };
   });
 
-  // Shell handler: registered ONLY when GBRAIN_ALLOW_SHELL_JOBS=1 is set on the
-  // worker process. Default-closed; opt-in per-host. Without the flag, shell
-  // jobs submitted via CLI insert rows but no worker claims them (they sit in
-  // 'waiting' — the CLI prints a starvation warning for that case).
-  if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
+  // Shell handler is always registered. Runtime env guard lives inside the
+  // handler so claimed jobs emit a clear rejection log on workers missing
+  // GBRAIN_ALLOW_SHELL_JOBS=1.
+  {
     const { shellHandler } = await import('../core/minions/handlers/shell.ts');
     worker.register('shell', shellHandler);
-    process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
-  } else {
-    process.stderr.write('[minion worker] shell handler disabled (set GBRAIN_ALLOW_SHELL_JOBS=1 to enable)\n');
+    if (process.env.GBRAIN_ALLOW_SHELL_JOBS === '1') {
+      process.stderr.write('[minion worker] shell handler enabled (GBRAIN_ALLOW_SHELL_JOBS=1)\n');
+    } else {
+      process.stderr.write('[minion worker] shell handler registered in guarded mode (set GBRAIN_ALLOW_SHELL_JOBS=1 to execute shell jobs)\n');
+    }
+  }
+
+  // v0.15 subagent handlers: always-on. Unlike shell (which needs an env
+  // flag because of RCE surface), subagent only calls the Anthropic API
+  // with the operator's own ANTHROPIC_API_KEY — no key, the SDK call
+  // fails immediately. Who-can-submit is already gated by
+  // PROTECTED_JOB_NAMES + TrustedSubmitOpts (MCP can't submit subagent
+  // jobs; only the CLI path with allowProtectedSubmit can). No separate
+  // cost-ceremony env flag needed.
+  const { makeSubagentHandler } = await import('../core/minions/handlers/subagent.ts');
+  const { subagentAggregatorHandler } = await import('../core/minions/handlers/subagent-aggregator.ts');
+  worker.register('subagent', makeSubagentHandler({ engine }));
+  worker.register('subagent_aggregator', subagentAggregatorHandler);
+  process.stderr.write('[minion worker] subagent handlers enabled\n');
+
+  // Plugin discovery — one line per discovered plugin (mirrors the
+  // openclaw-seam startup line convention from v0.11+). Loaded
+  // unconditionally; empty GBRAIN_PLUGIN_PATH is a no-op.
+  try {
+    const { loadPluginsFromEnv } = await import('../core/minions/plugin-loader.ts');
+    const { BRAIN_TOOL_ALLOWLIST } = await import('../core/minions/tools/brain-allowlist.ts');
+    const validNames = new Set<string>();
+    for (const n of BRAIN_TOOL_ALLOWLIST) validNames.add(`brain_${n}`);
+    const loaded = loadPluginsFromEnv({ validAgentToolNames: validNames });
+    for (const w of loaded.warnings) process.stderr.write(w + '\n');
+    for (const p of loaded.plugins) {
+      process.stderr.write(
+        `[plugin-loader] loaded '${p.manifest.name}' v${p.manifest.version} (${p.subagents.length} subagents)\n`,
+      );
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`[plugin-loader] discovery failed: ${msg}\n`);
   }
 }

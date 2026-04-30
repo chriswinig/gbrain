@@ -8,12 +8,12 @@
  */
 
 import { createEngine } from '../core/engine-factory.ts';
-import { loadConfig, saveConfig, toEngineConfig, type GBrainConfig } from '../core/config.ts';
+import { loadConfig, saveConfig, toEngineConfig, gbrainPath, type GBrainConfig } from '../core/config.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import type { EngineConfig } from '../core/types.ts';
-import { homedir } from 'os';
-import { join } from 'path';
 import { writeFileSync, readFileSync, existsSync, unlinkSync } from 'fs';
+import { createProgress } from '../core/progress.ts';
+import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 
 interface MigrateOpts {
   targetEngine: 'postgres' | 'pglite';
@@ -46,7 +46,7 @@ function parseArgs(args: string[]): MigrateOpts {
 }
 
 function getManifestPath(): string {
-  return join(homedir(), '.gbrain', 'migrate-manifest.json');
+  return gbrainPath('migrate-manifest.json');
 }
 
 interface MigrateManifest {
@@ -97,7 +97,7 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
       process.exit(1);
     }
   } else {
-    targetConfig.database_path = opts.targetPath || join(homedir(), '.gbrain', 'brain.pglite');
+    targetConfig.database_path = opts.targetPath || gbrainPath('brain.pglite');
   }
 
   // Connect to target
@@ -145,6 +145,9 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
   const pagesToMigrate = allPages.filter(p => !completedSet.has(p.slug));
 
   console.log(`Migrating ${pagesToMigrate.length} pages (${allPages.length} total, ${completedSet.size} already done)...`);
+
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  progress.start('migrate.copy_pages', pagesToMigrate.length);
 
   let migrated = 0;
   for (const page of pagesToMigrate) {
@@ -203,20 +206,21 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
     manifest!.completed_slugs.push(page.slug);
     saveManifest(manifest!);
     migrated++;
-
-    if (migrated % 50 === 0 || migrated === pagesToMigrate.length) {
-      console.log(`  Progress: ${migrated}/${pagesToMigrate.length} pages`);
-    }
+    progress.tick(1, page.slug);
   }
+  progress.finish();
 
   // Copy links (after all pages exist in target)
   console.log('Copying links...');
+  progress.start('migrate.copy_links', allPages.length);
   for (const page of allPages) {
     const links = await sourceEngine.getLinks(page.slug);
     for (const link of links) {
       await targetEngine.addLink(link.from_slug, link.to_slug, link.context, link.link_type);
     }
+    progress.tick(1);
   }
+  progress.finish();
 
   // Copy config (selective)
   const configKeys = ['embedding_model', 'embedding_dimensions', 'chunk_strategy'];

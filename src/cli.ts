@@ -6,6 +6,7 @@ import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
 import { serializeMarkdown } from './core/markdown.ts';
+import { parseGlobalFlags, setCliOptions, getCliOptions } from './core/cli-options.ts';
 import { VERSION } from './version.ts';
 
 // Build CLI name -> operation lookup
@@ -18,10 +19,16 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test']);
 
 async function main() {
-  const args = process.argv.slice(2);
+  // Parse global flags (--quiet / --progress-json / --progress-interval)
+  // BEFORE command dispatch, so `gbrain --progress-json doctor` works.
+  // The stripped argv is what the command sees.
+  const rawArgs = process.argv.slice(2);
+  const { cliOpts, rest: args } = parseGlobalFlags(rawArgs);
+  setCliOptions(cliOpts);
+
   let command = args[0];
 
   if (!command || command === '--help' || command === '-h') {
@@ -148,6 +155,7 @@ function makeContext(engine: BrainEngine, params: Record<string, unknown>): Oper
     // Local CLI invocation — the user owns the machine; do not apply remote-caller
     // confinement (e.g., cwd-locked file_upload).
     remote: false,
+    cliOpts: getCliOptions(),
   };
 }
 
@@ -278,6 +286,11 @@ async function handleCliOnly(command: string, args: string[]) {
     await runIntegrations(args);
     return;
   }
+  if (command === 'auth') {
+    const { runAuth } = await import('./commands/auth.ts');
+    await runAuth(args);
+    return;
+  }
   if (command === 'resolvers') {
     const { runResolvers } = await import('./commands/resolvers.ts');
     await runResolvers(args);
@@ -298,10 +311,46 @@ async function handleCliOnly(command: string, args: string[]) {
     await runBacklinks(args);
     return;
   }
+  if (command === 'frontmatter') {
+    const { runFrontmatter } = await import('./commands/frontmatter.ts');
+    await runFrontmatter(args);
+    return;
+  }
   if (command === 'lint') {
     const { runLint } = await import('./commands/lint.ts');
     await runLint(args);
     return;
+  }
+  if (command === 'check-resolvable') {
+    const { runCheckResolvable } = await import('./commands/check-resolvable.ts');
+    await runCheckResolvable(args);
+    return;
+  }
+  if (command === 'routing-eval') {
+    const { runRoutingEvalCli } = await import('./commands/routing-eval.ts');
+    await runRoutingEvalCli(args);
+    return;
+  }
+  if (command === 'skillify') {
+    const { runSkillify } = await import('./commands/skillify.ts');
+    // `args` here is subArgs (command already stripped by caller), so
+    // args[0] is the subcommand (scaffold|check).
+    await runSkillify(args);
+    return;
+  }
+  if (command === 'skillpack') {
+    const { runSkillpack } = await import('./commands/skillpack.ts');
+    // subArgs already has `skillpack` stripped; args[0] is the subcommand.
+    await runSkillpack(args);
+    return;
+  }
+  if (command === 'friction') {
+    const { runFriction } = await import('./commands/friction.ts');
+    process.exit(runFriction(args));
+  }
+  if (command === 'claw-test') {
+    const { runClawTest } = await import('./commands/claw-test.ts');
+    process.exit(await runClawTest(args));
   }
   if (command === 'report') {
     const { runReport } = await import('./commands/report.ts');
@@ -333,8 +382,11 @@ async function handleCliOnly(command: string, args: string[]) {
     // Doctor runs filesystem checks first (no DB needed), then DB checks.
     // --fast skips DB checks entirely.
     const { runDoctor } = await import('./commands/doctor.ts');
+    const { getDbUrlSource } = await import('./core/config.ts');
     if (args.includes('--fast')) {
-      await runDoctor(null, args);
+      // Pass the DB URL source so doctor can tell "no config at all" from
+      // "user chose --fast while config is present".
+      await runDoctor(null, args, getDbUrlSource());
     } else {
       try {
         const eng = await connectEngine();
@@ -342,8 +394,43 @@ async function handleCliOnly(command: string, args: string[]) {
         await eng.disconnect();
       } catch {
         // DB unavailable — still run filesystem checks
-        await runDoctor(null, args);
+        await runDoctor(null, args, getDbUrlSource());
       }
+    }
+    return;
+  }
+
+  if (command === 'smoke-test') {
+    // Run smoke tests — no DB connection needed, the script handles its own checks
+    const { execSync } = await import('child_process');
+    const { resolve, dirname } = await import('path');
+    const { fileURLToPath } = await import('url');
+    const scriptDir = dirname(fileURLToPath(import.meta.url));
+    const scriptPath = resolve(scriptDir, '..', 'scripts', 'smoke-test.sh');
+    try {
+      execSync(`bash "${scriptPath}"`, { stdio: 'inherit', env: { ...process.env } });
+    } catch (e: any) {
+      // Non-zero exit = some tests failed (exit code = failure count)
+      process.exit(e.status ?? 1);
+    }
+    return;
+  }
+
+  if (command === 'dream') {
+    // Dream mirrors doctor's pattern: filesystem phases run without a DB,
+    // so an engine connection failure is non-fatal. runCycle honestly
+    // reports DB phases as skipped when engine is null.
+    const { runDream } = await import('./commands/dream.ts');
+    let eng: BrainEngine | null = null;
+    try {
+      eng = await connectEngine();
+    } catch {
+      // DB unavailable — lint + backlinks still run against the brain dir.
+    }
+    try {
+      await runDream(eng, args);
+    } finally {
+      if (eng) await eng.disconnect();
     }
     return;
   }
@@ -374,7 +461,7 @@ async function handleCliOnly(command: string, args: string[]) {
       }
       case 'serve': {
         const { runServe } = await import('./commands/serve.ts');
-        await runServe(engine);
+        await runServe(engine, args);
         return; // serve doesn't disconnect
       }
       case 'call': {
@@ -403,6 +490,11 @@ async function handleCliOnly(command: string, args: string[]) {
         await runJobs(engine, args);
         break;
       }
+      case 'agent': {
+        const { runAgent } = await import('./commands/agent.ts');
+        await runAgent(engine, args);
+        break;
+      }
       case 'sync': {
         const { runSync } = await import('./commands/sync.ts');
         await runSync(engine, args);
@@ -428,9 +520,70 @@ async function handleCliOnly(command: string, args: string[]) {
         await runGraphQuery(engine, args);
         break;
       }
+      case 'reconcile-links': {
+        // v0.20.0 Cathedral II Layer 8 D3: batch-recompute doc↔impl edges
+        // for any markdown page that cites code files. Idempotent; safe to
+        // re-run. Closes the v0.19.0 Layer 6 order-dependency bug where
+        // guides imported before their code never got their edges written.
+        const { runReconcileLinksCli } = await import('./commands/reconcile-links.ts');
+        await runReconcileLinksCli(engine, args);
+        break;
+      }
       case 'orphans': {
         const { runOrphans } = await import('./commands/orphans.ts');
         await runOrphans(engine, args);
+        break;
+      }
+      case 'sources': {
+        const { runSources } = await import('./commands/sources.ts');
+        await runSources(engine, args);
+        break;
+      }
+      case 'storage': {
+        const { runStorage } = await import('./commands/storage.ts');
+        await runStorage(engine, args);
+        break;
+      }
+      case 'code-def': {
+        const { runCodeDef } = await import('./commands/code-def.ts');
+        await runCodeDef(engine, args);
+        break;
+      }
+      case 'code-refs': {
+        const { runCodeRefs } = await import('./commands/code-refs.ts');
+        await runCodeRefs(engine, args);
+        break;
+      }
+      case 'reindex-code': {
+        // v0.20.0 Cathedral II Layer 13 (E2): explicit code-page reindex
+        // for users upgrading from v0.19.0. Cost-preview gated; TTY prompt
+        // or ConfirmationRequired envelope for non-TTY/JSON callers.
+        const { runReindexCodeCli } = await import('./commands/reindex-code.ts');
+        await runReindexCodeCli(engine, args);
+        break;
+      }
+      case 'code-callers': {
+        // v0.20.0 Cathedral II Layer 10 (C4): "who calls <symbol>?"
+        const { runCodeCallers } = await import('./commands/code-callers.ts');
+        await runCodeCallers(engine, args);
+        break;
+      }
+      case 'code-callees': {
+        // v0.20.0 Cathedral II Layer 10 (C5): "what does <symbol> call?"
+        const { runCodeCallees } = await import('./commands/code-callees.ts');
+        await runCodeCallees(engine, args);
+        break;
+      }
+      case 'repos': {
+        // v0.19.0: `gbrain repos ...` is an alias into the v0.18.0 sources
+        // subsystem. The repos abstraction (Wintermute's baseline) was
+        // redundant with sources and carried per-user config state that
+        // couldn't participate in federation / RLS / multi-tenancy. We
+        // keep the alias so scripts like `gbrain repos add .` keep
+        // working, with a nudge toward the canonical command.
+        console.error('[gbrain] Note: "repos" is an alias for "sources" as of v0.19.0. Prefer `gbrain sources <subcommand>`.');
+        const { runSources } = await import('./commands/sources.ts');
+        await runSources(engine, args);
         break;
       }
     }
@@ -447,7 +600,10 @@ async function connectEngine(): Promise<BrainEngine> {
   }
   const { createEngine } = await import('./core/engine-factory.ts');
   const engine = await createEngine(toEngineConfig(config));
-  await engine.connect(toEngineConfig(config));
+  const noRetry = process.argv.includes('--no-retry-connect') ||
+                  process.env.GBRAIN_NO_RETRY_CONNECT === '1';
+  const { connectWithRetry } = await import('./core/db.ts');
+  await connectWithRetry(engine, toEngineConfig(config), { noRetry });
   return engine;
 }
 
@@ -503,6 +659,8 @@ IMPORT/EXPORT
   sync --watch [--interval N]        Continuous sync (loops until stopped)
   sync --install-cron                Install persistent sync daemon
   export [--dir ./out/]              Export to markdown
+  export --restore-only [--repo <p>] Restore missing supabase-only files
+        [--type T] [--slug-prefix S] With optional filters
 
 FILES
   files list [slug]                  List stored files
@@ -542,7 +700,29 @@ TOOLS
   check-backlinks <check|fix> [dir]  Find/fix missing back-links across brain
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  dream [--dry-run] [--json]         Run the overnight maintenance cycle once (cron-friendly).
+                                     See also: autopilot --install (continuous daemon).
+  check-resolvable [--json] [--fix]  Validate skill tree (reachability/MECE/DRY)
   report --type <name> --content ... Save timestamped report to brain/reports/
+
+SOURCES (multi-repo / multi-brain)
+  sources list                       Show registered sources
+  sources add <id> --path <p>        Register a source (id = short name, e.g. 'wiki')
+  sources remove <id>                Remove a source + its pages
+  sync --all                         Sync all sources with a local_path
+  sync --source <id>                 Sync one specific source
+  repos ...                          DEPRECATED alias for 'sources' (v0.19.0)
+
+CODE INDEXING (v0.19.0 / v0.20.0 Cathedral II)
+  code-def <symbol> [--lang l]       Find the definition of a symbol across code pages
+  code-refs <symbol> [--lang l]      Find all references to a symbol (JSON-first)
+  code-callers <symbol>              Who calls this symbol? (v0.20.0 A1)
+  code-callees <symbol>              What does this symbol call? (v0.20.0 A1)
+  query <q> --lang <l>               Filter hybrid search to one language (v0.20.0)
+  query <q> --symbol-kind <k>        Filter to symbol type (function|class|method|...) (v0.20.0)
+  reconcile-links [--dry-run]        Batch-recompute doc↔impl edges (v0.20.0)
+  reindex-code [--source id] [--yes] Explicit code-page reindex (v0.20.0)
+  sync --strategy code               Sync code files into the brain
 
 JOBS (Minions)
   jobs submit <name> [--params JSON]  Submit background job [--follow] [--dry-run]
@@ -562,6 +742,8 @@ ADMIN
   features [--json] [--auto-fix]     Scan usage + recommend unused features
   autopilot [--repo] [--interval N]  Self-maintaining brain daemon
   config [show|get|set] <key> [val]  Brain config
+  storage status [--repo <path>]     Storage tier status and health
+        [--json]                     (git-tracked vs supabase-only)
   serve                              MCP server (stdio)
   call <tool> '<json>'               Raw tool invocation
   version                            Version info

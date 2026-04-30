@@ -102,6 +102,64 @@ export class MinionQueue {
         if (existing.length > 0) return rowToMinionJob(existing[0]);
       }
 
+      // 1b. Submission-time backpressure for high-frequency named jobs.
+      // If waiting jobs for this (name, queue) already hit maxWaiting, return
+      // the most-recent waiting row instead of inserting another slot.
+      //
+      // Correctness: two concurrent submitters could both see waitingCount <
+      // maxWaiting and both insert, violating the cap. `pg_advisory_xact_lock`
+      // keyed on (name, queue) serializes concurrent count+insert decisions
+      // for the SAME key while leaving different keys fully parallel. The
+      // lock releases on txn commit/rollback automatically — no cleanup path
+      // to leak. Cost: one no-op SELECT on the hot path per coalesce-guarded
+      // submission; trivial compared to the protection.
+      //
+      // Queue scope: the filter includes `queue=$2` so a waiting
+      // 'autopilot-cycle' in queue 'default' does NOT suppress submissions
+      // to queue 'shell' with the same name. Pre-D2 code filtered on `name`
+      // alone — a real cross-queue bleed that sequential tests missed.
+      //
+      // Engine compatibility: PGLite (WASM Postgres 17) supports
+      // pg_advisory_xact_lock, so this works on both engines without branching.
+      if (opts?.maxWaiting !== undefined) {
+        const maxWaiting = Math.max(1, Math.floor(opts.maxWaiting));
+        const backpressureQueue = opts?.queue ?? 'default';
+        await tx.executeRaw(
+          `SELECT pg_advisory_xact_lock(hashtext('minion_maxwaiting:' || $1 || ':' || $2))`,
+          [jobName, backpressureQueue]
+        );
+        const waitingCountRows = await tx.executeRaw<{ count: string }>(
+          `SELECT count(*)::text AS count
+           FROM minion_jobs
+           WHERE name = $1 AND queue = $2 AND status = 'waiting'`,
+          [jobName, backpressureQueue]
+        );
+        const waitingCount = parseInt(waitingCountRows[0]?.count ?? '0', 10);
+        if (waitingCount >= maxWaiting) {
+          const existingWaiting = await tx.executeRaw<Record<string, unknown>>(
+            `SELECT * FROM minion_jobs
+             WHERE name = $1 AND queue = $2 AND status = 'waiting'
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1`,
+            [jobName, backpressureQueue]
+          );
+          if (existingWaiting.length > 0) {
+            const coalesced = rowToMinionJob(existingWaiting[0]);
+            try {
+              const { logBackpressureCoalesce } = await import('./backpressure-audit.ts');
+              logBackpressureCoalesce({
+                queue: backpressureQueue,
+                name: jobName,
+                waiting_count: waitingCount,
+                max_waiting: maxWaiting,
+                returned_job_id: coalesced.id,
+              });
+            } catch { /* audit failures never block submission */ }
+            return coalesced;
+          }
+        }
+      }
+
       // 2. Parent lock + depth/cap validation
       let depth = 0;
       if (opts?.parent_job_id) {
@@ -134,23 +192,40 @@ export class MinionQueue {
 
       // 3. Insert child. Use ON CONFLICT for idempotency; if a concurrent submit
       //    raced past the fast-path SELECT, the unique index catches it here.
-      //    v12 adds quiet_hours + stagger_key passed through from opts.
-      const insertSql = opts?.idempotency_key
-        ? `INSERT INTO minion_jobs (name, queue, status, priority, data, max_attempts, backoff_type,
+      //    quiet_hours + stagger_key always present (null fallback; schema
+      //    stores NULL). max_stalled is conditional: provided values get
+      //    clamped to [1, 100] and included in the INSERT; omitted values
+      //    skip the column so the schema DEFAULT (5 as of v0.14.1) kicks in.
+      //    Keeps the app layer from hardcoding the schema default constant.
+      //
+      //    Footgun note (codex iter 3): threading max_stalled on INSERT only is
+      //    deliberate. An idempotency-key hit returns the EXISTING row via the
+      //    fast-path SELECT above — we do NOT UPDATE max_stalled on a re-submit,
+      //    because letting a second submitter mutate the first submitter's
+      //    durability semantics is a nasty surprise.
+      const hasMaxStalled = opts?.max_stalled !== undefined && opts.max_stalled !== null;
+      const clampedMaxStalled = hasMaxStalled
+        ? Math.max(1, Math.min(100, Math.floor(opts!.max_stalled as number)))
+        : null;
+
+      const baseCols = `name, queue, status, priority, data, max_attempts, backoff_type,
             backoff_delay, backoff_jitter, delay_until, parent_job_id, on_child_fail,
             depth, max_children, timeout_ms, remove_on_complete, remove_on_fail, idempotency_key,
-            quiet_hours, stagger_key)
-           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20)
+            quiet_hours, stagger_key`;
+      const baseVals = `$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20`;
+      const cols = hasMaxStalled ? `${baseCols}, max_stalled` : baseCols;
+      const vals = hasMaxStalled ? `${baseVals}, $21` : baseVals;
+
+      const insertSql = opts?.idempotency_key
+        ? `INSERT INTO minion_jobs (${cols})
+           VALUES (${vals})
            ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
            RETURNING *`
-        : `INSERT INTO minion_jobs (name, queue, status, priority, data, max_attempts, backoff_type,
-            backoff_delay, backoff_jitter, delay_until, parent_job_id, on_child_fail,
-            depth, max_children, timeout_ms, remove_on_complete, remove_on_fail, idempotency_key,
-            quiet_hours, stagger_key)
-           VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, $20)
+        : `INSERT INTO minion_jobs (${cols})
+           VALUES (${vals})
            RETURNING *`;
 
-      const params = [
+      const params: unknown[] = [
         jobName,
         opts?.queue ?? 'default',
         childStatus,
@@ -172,6 +247,7 @@ export class MinionQueue {
         opts?.quiet_hours ?? null,
         opts?.stagger_key ?? null,
       ];
+      if (hasMaxStalled) params.push(clampedMaxStalled);
 
       const inserted = await tx.executeRaw<Record<string, unknown>>(insertSql, params);
 
@@ -274,29 +350,83 @@ export class MinionQueue {
    * Returns the *root* (the job matching id), not an arbitrary descendant.
    */
   async cancelJob(id: number): Promise<MinionJob | null> {
-    const rows = await this.engine.executeRaw<Record<string, unknown>>(
-      `WITH RECURSIVE descendants AS (
-        SELECT id, 0 AS d FROM minion_jobs WHERE id = $1
-        UNION ALL
-        SELECT m.id, descendants.d + 1
-          FROM minion_jobs m
-          JOIN descendants ON m.parent_job_id = descendants.id
-          WHERE descendants.d < 100
-      )
-      UPDATE minion_jobs SET
-        status = 'cancelled',
-        lock_token = NULL,
-        lock_until = NULL,
-        finished_at = now(),
-        updated_at = now()
-       WHERE id IN (SELECT id FROM descendants)
-         AND status IN ('waiting','active','delayed','waiting-children','paused')
-       RETURNING *`,
-      [id]
-    );
-    if (rows.length === 0) return null;
-    const root = rows.find(r => (r.id as number) === id);
-    return root ? rowToMinionJob(root) : null;
+    return this.engine.transaction(async (tx) => {
+      const rows = await tx.executeRaw<Record<string, unknown>>(
+        `WITH RECURSIVE descendants AS (
+          SELECT id, 0 AS d FROM minion_jobs WHERE id = $1
+          UNION ALL
+          SELECT m.id, descendants.d + 1
+            FROM minion_jobs m
+            JOIN descendants ON m.parent_job_id = descendants.id
+            WHERE descendants.d < 100
+        )
+        UPDATE minion_jobs SET
+          status = 'cancelled',
+          lock_token = NULL,
+          lock_until = NULL,
+          finished_at = now(),
+          updated_at = now()
+         WHERE id IN (SELECT id FROM descendants)
+           AND status IN ('waiting','active','delayed','waiting-children','paused')
+         RETURNING *`,
+        [id]
+      );
+      if (rows.length === 0) return null;
+
+      // v0.15: emit child_done(outcome='cancelled') for every cancelled row
+      // that had a parent. Without this, an aggregator waiting for N
+      // child_done messages hangs forever when a child is cancelled (codex
+      // iteration 3). Also unblock any aggregator parents whose last
+      // non-terminal child we just cancelled.
+      const parentIds = new Set<number>();
+      for (const r of rows) {
+        const childId = r.id as number;
+        const parentJobId = r.parent_job_id as number | null;
+        const name = r.name as string;
+        // Skip the root if it's the caller's cancel target AND has no parent.
+        // Descendants whose parent got cancelled in the same sweep still
+        // benefit from the inbox message — their parent exits waiting-children
+        // via the resolve sweep below even though the parent is itself
+        // cancelled (EXISTS guard on inbox INSERT handles it).
+        if (parentJobId == null) continue;
+        parentIds.add(parentJobId);
+        const childDone: ChildDoneMessage = {
+          type: 'child_done',
+          child_id: childId,
+          job_name: name,
+          result: null,
+          outcome: 'cancelled',
+          error: 'cancelled',
+        };
+        await tx.executeRaw(
+          `INSERT INTO minion_inbox (job_id, sender, payload)
+           SELECT $1, 'minions', $2::jsonb
+           WHERE EXISTS (
+             SELECT 1 FROM minion_jobs
+             WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
+           )`,
+          [parentJobId, childDone]
+        );
+      }
+
+      // Resolve any non-cancelled aggregator parents sitting on
+      // waiting-children whose last open child we just cancelled.
+      for (const parentId of parentIds) {
+        await tx.executeRaw(
+          `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
+           WHERE id = $1 AND status = 'waiting-children'
+             AND NOT EXISTS (
+               SELECT 1 FROM minion_jobs
+               WHERE parent_job_id = $1
+                 AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
+             )`,
+          [parentId]
+        );
+      }
+
+      const root = rows.find(r => (r.id as number) === id);
+      return root ? rowToMinionJob(root) : null;
+    });
   }
 
   /** Re-queue a failed or dead job for retry. */
@@ -428,21 +558,138 @@ export class MinionQueue {
    * but will be caught the next one (after re-claim). Never double-handled.
    */
   async handleTimeouts(): Promise<MinionJob[]> {
-    const rows = await this.engine.executeRaw<Record<string, unknown>>(
-      `UPDATE minion_jobs SET
-        status = 'dead',
-        error_text = 'timeout exceeded',
-        lock_token = NULL,
-        lock_until = NULL,
-        finished_at = now(),
-        updated_at = now()
-       WHERE status = 'active'
-         AND timeout_at IS NOT NULL
-         AND timeout_at < now()
-         AND lock_until > now()
-       RETURNING *`
-    );
-    return rows.map(rowToMinionJob);
+    return this.engine.transaction(async (tx) => {
+      const rows = await tx.executeRaw<Record<string, unknown>>(
+        `UPDATE minion_jobs SET
+          status = 'dead',
+          error_text = 'timeout exceeded',
+          lock_token = NULL,
+          lock_until = NULL,
+          finished_at = now(),
+          updated_at = now()
+         WHERE status = 'active'
+           AND timeout_at IS NOT NULL
+           AND timeout_at < now()
+           AND lock_until > now()
+         RETURNING *`
+      );
+
+      // v0.15: emit child_done(outcome='timeout') for every timed-out job that
+      // had a parent. Without this, an aggregator waiting for N child_done
+      // messages hangs forever when a child times out (codex iteration 3).
+      // Outcome 'timeout' is distinct from 'dead' so consumers can distinguish
+      // "timed out during run" from "died via max-stall".
+      const parentIds = new Set<number>();
+      for (const r of rows) {
+        const parentJobId = r.parent_job_id as number | null;
+        if (parentJobId == null) continue;
+        parentIds.add(parentJobId);
+        const childDone: ChildDoneMessage = {
+          type: 'child_done',
+          child_id: r.id as number,
+          job_name: r.name as string,
+          result: null,
+          outcome: 'timeout',
+          error: 'timeout exceeded',
+        };
+        await tx.executeRaw(
+          `INSERT INTO minion_inbox (job_id, sender, payload)
+           SELECT $1, 'minions', $2::jsonb
+           WHERE EXISTS (
+             SELECT 1 FROM minion_jobs
+             WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
+           )`,
+          [parentJobId, childDone]
+        );
+      }
+
+      // Unblock any aggregator parents whose last open child we just killed.
+      for (const parentId of parentIds) {
+        await tx.executeRaw(
+          `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
+           WHERE id = $1 AND status = 'waiting-children'
+             AND NOT EXISTS (
+               SELECT 1 FROM minion_jobs
+               WHERE parent_job_id = $1
+                 AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
+             )`,
+          [parentId]
+        );
+      }
+
+      return rows.map(rowToMinionJob);
+    });
+  }
+
+  /**
+   * Dead-letter active jobs that exceed a wall-clock runtime threshold,
+   * regardless of lock state. This catches jobs stuck while still holding
+   * DB resources (e.g. blocked on file locks) where stall sweeps skip rows.
+   *
+   * Threshold (ms):
+   *   timeout_ms set   -> timeout_ms * 2
+   *   timeout_ms null  -> 2 * lockDurationMs * max_stalled
+   */
+  async handleWallClockTimeouts(lockDurationMs: number): Promise<MinionJob[]> {
+    return this.engine.transaction(async (tx) => {
+      const rows = await tx.executeRaw<Record<string, unknown>>(
+        `UPDATE minion_jobs SET
+          status = 'dead',
+          error_text = 'wall-clock timeout exceeded',
+          lock_token = NULL,
+          lock_until = NULL,
+          finished_at = now(),
+          updated_at = now()
+         WHERE status = 'active'
+           AND started_at IS NOT NULL
+           AND EXTRACT(EPOCH FROM (now() - started_at)) * 1000 >
+             CASE
+               WHEN timeout_ms IS NOT NULL THEN timeout_ms * 2
+               ELSE $1::double precision * 2 * GREATEST(max_stalled, 1)
+             END
+         RETURNING *`,
+        [lockDurationMs]
+      );
+
+      const parentIds = new Set<number>();
+      for (const r of rows) {
+        const parentJobId = r.parent_job_id as number | null;
+        if (parentJobId == null) continue;
+        parentIds.add(parentJobId);
+        const childDone: ChildDoneMessage = {
+          type: 'child_done',
+          child_id: r.id as number,
+          job_name: r.name as string,
+          result: null,
+          outcome: 'timeout',
+          error: 'wall-clock timeout exceeded',
+        };
+        await tx.executeRaw(
+          `INSERT INTO minion_inbox (job_id, sender, payload)
+           SELECT $1, 'minions', $2::jsonb
+           WHERE EXISTS (
+             SELECT 1 FROM minion_jobs
+             WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
+           )`,
+          [parentJobId, childDone]
+        );
+      }
+
+      for (const parentId of parentIds) {
+        await tx.executeRaw(
+          `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
+           WHERE id = $1 AND status = 'waiting-children'
+             AND NOT EXISTS (
+               SELECT 1 FROM minion_jobs
+               WHERE parent_job_id = $1
+                 AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
+             )`,
+          [parentId]
+        );
+      }
+
+      return rows.map(rowToMinionJob);
+    });
   }
 
   /**
@@ -512,6 +759,7 @@ export class MinionQueue {
           child_id: completed.id,
           job_name: completed.name,
           result: result ?? null,
+          outcome: 'complete',
         };
         await tx.executeRaw(
           `INSERT INTO minion_inbox (job_id, sender, payload)
@@ -523,14 +771,17 @@ export class MinionQueue {
           [completed.parent_job_id, childDone]
         );
 
-        // Fold-in resolveParent: flip parent to waiting once all children done.
+        // Fold-in resolveParent: flip parent to waiting once all children are
+        // in ANY terminal state. Terminal set includes 'failed' so a failed
+        // child with on_child_fail='continue'/'ignore' doesn't strand the
+        // parent in waiting-children forever (v0.15 aggregator fix).
         await tx.executeRaw(
           `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
            WHERE id = $1 AND status = 'waiting-children'
              AND NOT EXISTS (
                SELECT 1 FROM minion_jobs
                WHERE parent_job_id = $1
-                 AND status NOT IN ('completed', 'dead', 'cancelled')
+                 AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
              )`,
           [completed.parent_job_id]
         );
@@ -604,6 +855,29 @@ export class MinionQueue {
 
       // Parent hook on terminal failure.
       if (terminal && failed.parent_job_id) {
+        // v0.15: emit child_done(outcome='failed') BEFORE any parent-terminal
+        // update. Insertion order matters because `completeJob`'s inbox-write
+        // EXISTS guard skips writes once the parent is 'failed' — if we let
+        // the fail_parent UPDATE run first, this inbox row would be dropped
+        // for aggregator-style parents that still want to count it (codex).
+        const childDone: ChildDoneMessage = {
+          type: 'child_done',
+          child_id: failed.id,
+          job_name: failed.name,
+          result: null,
+          outcome: newStatus === 'dead' ? 'dead' : 'failed',
+          error: errorText,
+        };
+        await tx.executeRaw(
+          `INSERT INTO minion_inbox (job_id, sender, payload)
+           SELECT $1, 'minions', $2::jsonb
+           WHERE EXISTS (
+             SELECT 1 FROM minion_jobs
+             WHERE id = $1 AND status NOT IN ('completed','failed','dead','cancelled')
+           )`,
+          [failed.parent_job_id, childDone]
+        );
+
         if (failed.on_child_fail === 'fail_parent') {
           await tx.executeRaw(
             `UPDATE minion_jobs SET status = 'failed',
@@ -616,19 +890,37 @@ export class MinionQueue {
             `UPDATE minion_jobs SET parent_job_id = NULL, updated_at = now() WHERE id = $1`,
             [failed.id]
           );
-          // After dropping the dep, try to resolve the parent if all OTHER kids are done.
+          // After dropping the dep, try to resolve the parent if all OTHER
+          // kids are terminal. Terminal set includes 'failed' (v0.15).
           await tx.executeRaw(
             `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
              WHERE id = $1 AND status = 'waiting-children'
                AND NOT EXISTS (
                  SELECT 1 FROM minion_jobs
                  WHERE parent_job_id = $1
-                   AND status NOT IN ('completed', 'dead', 'cancelled')
+                   AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
+               )`,
+            [failed.parent_job_id]
+          );
+        } else {
+          // 'ignore' / 'continue': parent stays in waiting-children waiting on
+          // siblings. With v0.15 terminal-set expansion + child_done emission
+          // above, an aggregator sibling-count model now works: all N children
+          // reach terminal → completeJob on a sibling (or the LAST terminal
+          // transition here) flips parent → waiting once no non-terminal kids
+          // remain. Run the resolve check here so the last child transitioning
+          // via THIS code path still unblocks the parent.
+          await tx.executeRaw(
+            `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
+             WHERE id = $1 AND status = 'waiting-children'
+               AND NOT EXISTS (
+                 SELECT 1 FROM minion_jobs
+                 WHERE parent_job_id = $1
+                   AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
                )`,
             [failed.parent_job_id]
           );
         }
-        // 'ignore' / 'continue' → parent stays in waiting-children waiting on siblings
       }
 
       // remove_on_fail cleanup AFTER parent hook.
@@ -713,7 +1005,13 @@ export class MinionQueue {
     return { requeued, dead };
   }
 
-  /** Check if all children of a parent are done. If so, unblock parent. */
+  /**
+   * Check if all children of a parent are in ANY terminal state. If so,
+   * unblock parent (flip waiting-children → waiting).
+   *
+   * v0.15: terminal set includes 'failed' so a child failing with
+   * on_child_fail='continue'/'ignore' doesn't strand the parent.
+   */
   async resolveParent(parentId: number): Promise<MinionJob | null> {
     const rows = await this.engine.executeRaw<Record<string, unknown>>(
       `UPDATE minion_jobs SET status = 'waiting', updated_at = now()
@@ -721,7 +1019,7 @@ export class MinionQueue {
          AND NOT EXISTS (
            SELECT 1 FROM minion_jobs
            WHERE parent_job_id = $1
-             AND status NOT IN ('completed', 'dead', 'cancelled')
+             AND status NOT IN ('completed', 'failed', 'dead', 'cancelled')
          )
        RETURNING *`,
       [parentId]
