@@ -32,7 +32,19 @@ export async function embed(text: string): Promise<Float32Array> {
   return result[0];
 }
 
-export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
+export interface EmbedBatchOptions {
+  /**
+   * Optional callback fired after each 100-item sub-batch completes.
+   * CLI wrappers tick a reporter; Minion handlers can call
+   * job.updateProgress here instead of hooking the per-page callback.
+   */
+  onBatchComplete?: (done: number, total: number) => void;
+}
+
+export async function embedBatch(
+  texts: string[],
+  options: EmbedBatchOptions = {},
+): Promise<Float32Array[]> {
   const truncated = texts.map(t => t.slice(0, MAX_CHARS));
   const results: Float32Array[] = [];
 
@@ -41,6 +53,7 @@ export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
     const batch = truncated.slice(i, i + BATCH_SIZE);
     const batchResults = await embedBatchWithRetry(batch);
     results.push(...batchResults);
+    options.onBatchComplete?.(results.length, truncated.length);
   }
 
   return results;
@@ -92,3 +105,20 @@ function sleep(ms: number): Promise<void> {
 }
 
 export { MODEL as EMBEDDING_MODEL, DIMENSIONS as EMBEDDING_DIMENSIONS };
+
+/**
+ * v0.20.0 Cathedral II Layer 8 (D1): USD cost per 1k tokens for
+ * text-embedding-3-large. Used by `gbrain sync --all` cost preview and
+ * the reindex-code backfill command to surface expected spend before
+ * the agent/user accepts an expensive operation.
+ *
+ * Value: $0.00013 / 1k tokens as of 2026. Update when OpenAI changes
+ * pricing. Single source of truth — every cost-preview surface reads
+ * this constant, so a pricing change is a one-line edit.
+ */
+export const EMBEDDING_COST_PER_1K_TOKENS = 0.00013;
+
+/** Compute USD cost estimate for embedding `tokens` at current model rate. */
+export function estimateEmbeddingCostUsd(tokens: number): number {
+  return (tokens / 1000) * EMBEDDING_COST_PER_1K_TOKENS;
+}

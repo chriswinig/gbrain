@@ -1,35 +1,47 @@
+---
+name: enrich
+version: 1.0.0
+description: |
+  Enrich brain pages with tiered enrichment protocol. Creates and updates
+  person/company pages with compiled truth, timeline, and cross-links.
+  Use when a new entity is mentioned or an existing page needs updating.
+triggers:
+  - "enrich"
+  - "create person page"
+  - "update company page"
+  - "who is this person"
+  - "look up this company"
+tools:
+  - get_page
+  - put_page
+  - search
+  - query
+  - add_link
+  - add_timeline_entry
+  - get_backlinks
+mutating: true
+---
+
 # Enrich Skill
 
 Enrich person and company pages from external sources. Scale effort to importance.
 
+## Contract
+
+- Shared quality rules follow `skills/conventions/quality.md` (citations, back-links, notability gate).
+- Every enriched page has compiled truth (State section) with inline citations
+- Every enriched page has a timeline with dated entries
+- Back-links are created bidirectionally
+- Tiered enrichment: Tier 1 (full), Tier 2 (medium), Tier 3 (minimal) based on filing relevance
+- No stubs: every new page has meaningful content from web search or existing brain context
+
 > **Filing rule:** Read `skills/_brain-filing-rules.md` before creating any new page.
-
-## Iron Law: Back-Linking (MANDATORY)
-
-Every mention of a person or company with a brain page MUST create a back-link
-FROM that entity's page TO the page mentioning them. An unlinked mention is a
-broken brain. See `skills/_brain-filing-rules.md` for format.
 
 ## Philosophy
 
 A brain page should read like an intelligence dossier, not a LinkedIn scrape.
 Facts are table stakes. Texture is the value -- what do they believe, what are
 they building, what makes them tick, where are they headed.
-
-## Citation Requirements (MANDATORY)
-
-Every fact must carry an inline `[Source: ...]` citation.
-
-Three formats:
-- **Direct attribution:** `[Source: User, {context}, YYYY-MM-DD]`
-- **API/external:** `[Source: {provider} enrichment, YYYY-MM-DD]`
-- **Synthesis:** `[Source: compiled from {list of sources}]`
-
-Source precedence (highest to lowest):
-1. User's direct statements
-2. Compiled truth (pre-existing brain synthesis)
-3. Timeline entries (raw evidence)
-4. External sources (API enrichment, web search)
 
 When sources conflict, note the contradiction with both citations.
 
@@ -69,7 +81,7 @@ Extract people, companies, concepts from the incoming signal.
 For each entity:
 - `gbrain search "name"` -- does a page already exist?
 - **If yes:** UPDATE path (add new signal, update compiled truth if material)
-- **If no:** CREATE path (check notability gate first, then create)
+- **If no:** CREATE path (check filing rules first, then create)
 
 ### Step 3: Extract signal from source
 
@@ -138,7 +150,7 @@ the raw data shows exactly what the API returned.
 
 #### CREATE path
 
-1. Check notability gate (see `skills/_brain-filing-rules.md`)
+1. Check `skills/_brain-filing-rules.md` before creating the page
 2. Check filing rules -- where does this entity go?
 3. Create page with the appropriate template (below)
 4. Fill compiled truth with citations
@@ -246,8 +258,14 @@ Active items, pending decisions, things to track.
 
 - Update company pages from person enrichment (and vice versa)
 - Update related project/deal pages if relevant context surfaced
-- Add back-links from every entity mentioned (MANDATORY)
 - Check index files if the brain uses them
+
+**Note (v0.10.1):** Links between brain pages are auto-created on every
+`put_page` call (auto-link post-hook). Step 7 focuses on content
+cross-references (updating related pages' compiled truth with new signal
+from this enrichment), not on creating links. Verify via the `auto_links`
+field in the put_page response (`{ created, removed, errors }`).
+Timeline entries still need explicit `gbrain timeline-add` calls.
 
 ## Bulk Enrichment Rules
 
@@ -264,7 +282,7 @@ Active items, pending decisions, things to track.
 - Name mismatch between brain and API = skip, flag for review
 - Joke profiles or obviously wrong data = save to raw, don't update page
 - Don't overwrite user-written assessments with API boilerplate
-- When in doubt: save raw data but don't update brain page
+- If uncertain, save raw data without updating the brain page
 
 ## Report Storage
 
@@ -276,6 +294,34 @@ After enrichment sweeps, save a report:
 - Validation flags or API failures
 
 This creates an audit trail for brain enrichment over time.
+
+## Anti-Patterns
+
+- Creating stub pages with no content
+- Enriching without checking brain first
+- Overwriting user's direct statements with API data
+- Creating pages for non-notable entities
+
+## Output Format
+
+An enriched person page contains:
+- **Frontmatter** with type, tags, company, relationship, and contact fields
+- **Executive summary** (1 paragraph: how you know them, why they matter, relationship state)
+- **State** section with hard facts and inline `[Source: ...]` citations
+- **Texture sections** (What They Believe, What They're Building, What Motivates Them, Hobby Horses)
+- **Assessment** with trajectory read
+- **Relationship** history and contact info
+- **Network** connections and mutual contacts
+- **Timeline** in reverse chronological order, every entry dated with source citation
+
+An enriched company page contains:
+- **Frontmatter** with type and tags
+- **Executive summary** (1 paragraph)
+- **State** section (what they do, stage, key people, metrics, your connection)
+- **Open Threads** (active items, pending decisions)
+- **Timeline** in reverse chronological order with dated, cited entries
+
+Both page types have bidirectional back-links to every entity they mention.
 
 ## Tools Used
 

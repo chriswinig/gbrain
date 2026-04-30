@@ -19,7 +19,15 @@ secrets:
     description: Google OAuth2 client secret (Option B)
     where: https://console.cloud.google.com/apis/credentials — same page as client ID
 health_checks:
-  - "[ -n \"$CLAWVISOR_URL\" ] && curl -sf $CLAWVISOR_URL/health > /dev/null && echo 'ClawVisor: OK' || [ -n \"$GOOGLE_CLIENT_ID\" ] && echo 'Google OAuth: configured' || echo 'No email auth configured'"
+  - type: any_of
+    label: "Auth provider"
+    checks:
+      - type: http
+        url: "$CLAWVISOR_URL/health"
+        label: "ClawVisor"
+      - type: env_exists
+        name: GOOGLE_CLIENT_ID
+        label: "Google OAuth"
 setup_time: 20 min
 cost_estimate: "$0 (both options are free)"
 ---
@@ -96,7 +104,7 @@ Every email gets a baked-in Gmail link: `[Open in Gmail](https://mail.google.com
 3. **Gmail access** via one of:
    - ClawVisor (recommended: E2E encrypted credential gateway)
    - Google OAuth credentials (direct API access)
-   - Hermes Gateway (built-in Gmail connector)
+   - Hermes Gateway / local authenticated `gws` CLI (built-in Gmail connector path)
 
 ## Setup Flow
 
@@ -172,9 +180,9 @@ Then run the OAuth flow to get tokens:
 Create the collector directory and script:
 
 ```bash
-mkdir -p email-collector/data/{messages,digests}
-cd email-collector
-npm init -y
+mkdir -p scripts/email-collector/data/{messages,digests}
+cd scripts/email-collector
+# no package init needed — the scaffold is a zero-dependency Node script in-repo
 ```
 
 The collector script needs these capabilities:
@@ -192,31 +200,56 @@ Key design rules for the collector:
 ### Step 3: Run First Collection
 
 ```bash
-node email-collector.mjs collect
-node email-collector.mjs digest
+cd scripts/email-collector
+# If gws is already authenticated locally, use it as the provider:
+node email-collector.mjs collect --dir . --provider gws --gws-bin /opt/homebrew/bin/gws --account you@example.com
+node email-collector.mjs digest --dir .
 ```
 
 Verify: `ls data/digests/` should show today's digest file.
-Read the digest. Confirm it contains real emails with working Gmail links.
+Read the digest. Confirm it contains real emails with working Gmail links. If using `gws`, this should work immediately without setting up a separate collector auth flow.
 
 ### Step 4: Enrich Brain Pages
 
-This is YOUR job (the agent). Read the digest. For each email:
+Use the scaffold bridge first, then let the agent do deeper judgment work.
 
+```bash
+cd scripts/email-collector
+# --brain-dir should point at the brain root containing RESOLVER.md
+node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12 --sync
+# optional: add --embed-stale if you want embeddings refreshed immediately too
+```
+
+What the bridge does deterministically:
+1. treats `--brain-dir` as the brain root governed by `RESOLVER.md`
+2. reads `RESOLVER.md`, walks the top-level decision tree, and files senders/entities accordingly
+3. resolves sender identity from the collected message
+4. touches mentioned people and companies too when the email includes clear entity cues or matches existing brain pages
+5. preserves existing compiled truth while appending sourced timeline entries
+6. writes raw source data to `.raw/` sidecars under the resolved entity directories
+7. can optionally run `gbrain import <brain-dir> --no-embed` right after enrich via `--sync`
+
+The collector also preserves richer Gmail metadata for downstream automation:
+- `thread_id`
+- `message_id_header`
+- `label_ids`
+- `history_id`
+- `internal_date`
+- `to`, `cc`, `reply_to`, `delivered_to`
+
+Then the agent does the higher-judgment pass:
 1. **Detect entities**: who sent it? Who is mentioned? What companies?
 2. **Check the brain**: `gbrain search "sender name"` — do we have a page?
-3. **Update brain pages**: if sender has a brain page, append a timeline entry:
-   `- YYYY-MM-DD | Email from {sender}: {subject} [Source: Gmail, {date}]`
-4. **Create new pages**: if sender is notable and has no page, create one
-5. **Extract action items**: if the email requires a response or action, log it
-6. **Sync**: run `gbrain sync --no-pull --no-embed` to index changes
+3. **Update compiled truth** if the new email materially changes the state of play
+4. **Extract action items**: if the email requires a response or action, log it
+5. **Sync**: prefer `node email-collector.mjs enrich --dir . --brain-dir /path/to/brain --date 2026-04-12 --sync`; add `--embed-stale` when you want embeddings refreshed too
 
 ### Step 5: Set Up Cron
 
 The collector should run every 30 minutes:
 
 ```bash
-*/30 * * * * cd /path/to/email-collector && node email-collector.mjs collect && node email-collector.mjs digest
+*/30 * * * * cd /path/to/gbrain/scripts/email-collector && node email-collector.mjs collect --dir . --provider gws --gws-bin /opt/homebrew/bin/gws --account you@example.com && node email-collector.mjs digest --dir .
 ```
 
 The agent should read the digest on a schedule (e.g., 3x/day: 9 AM, 12 PM, 3 PM)
