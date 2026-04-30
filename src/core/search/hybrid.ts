@@ -336,6 +336,8 @@ async function expandGraphResults(
                 type: page.type,
                 chunk_text: buildGraphSnippet(page.compiled_truth, [seed.slug], depth),
                 chunk_source: 'compiled_truth',
+                chunk_id: -page.id,
+                chunk_index: 0,
                 score: contribution,
                 stale: false,
                 graph_depth: depth,

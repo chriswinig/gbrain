@@ -12,6 +12,8 @@ function makeSearchResult(slug: string, title: string, type: Page['type'], chunk
     type,
     chunk_text: chunkText,
     chunk_source: 'compiled_truth',
+    chunk_id: Math.abs(hashCode(`${slug}:${chunkText}`)),
+    chunk_index: 0,
     score,
     stale: false,
   };
@@ -37,7 +39,7 @@ function makePage(slug: string, title: string, type: Page['type'], compiledTruth
   };
 }
 
-class FakeEngine implements BrainEngine {
+class FakeEngine {
   pages = new Map<string, Page>([
     ['projects/wingate', makePage('projects/wingate', 'Wingate', 'project', 'Wingate is Chris’s family business.')],
     ['projects/lune', makePage('projects/lune', 'Lune', 'project', 'Lune is the cycle-aware fitness app.')],
@@ -104,25 +106,43 @@ class FakeEngine implements BrainEngine {
   async connect(_config: EngineConfig): Promise<void> {}
   async disconnect(): Promise<void> {}
   async initSchema(): Promise<void> {}
-  async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> { return fn(this); }
+  readonly kind = 'postgres' as const;
+  async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
+    return fn(this as unknown as BrainEngine);
+  }
+  async withReservedConnection<T>(_fn: any): Promise<T> { throw new Error('not implemented'); }
   async putPage(_slug: string, _page: PageInput): Promise<Page> { throw new Error('not implemented'); }
   async deletePage(_slug: string): Promise<void> { throw new Error('not implemented'); }
   async listPages(_filters?: PageFilters): Promise<Page[]> { throw new Error('not implemented'); }
   async resolveSlugs(_partial: string): Promise<string[]> { throw new Error('not implemented'); }
+  async getAllSlugs(): Promise<Set<string>> { return new Set(this.pages.keys()); }
   async searchVector(_embedding: Float32Array): Promise<SearchResult[]> { return []; }
+  async getEmbeddingsByChunkIds(_ids: number[]): Promise<Map<number, Float32Array>> { return new Map(); }
   async upsertChunks(_slug: string, _chunks: ChunkInput[]): Promise<void> { throw new Error('not implemented'); }
   async getChunks(_slug: string): Promise<Chunk[]> { throw new Error('not implemented'); }
+  async countStaleChunks(): Promise<number> { return 0; }
+  async listStaleChunks(): Promise<any[]> { return []; }
   async deleteChunks(_slug: string): Promise<void> { throw new Error('not implemented'); }
   async addLink(_from: string, _to: string, _context?: string, _linkType?: string): Promise<void> { throw new Error('not implemented'); }
+  async addLinksBatch(_links: any[]): Promise<number> { return 0; }
   async removeLink(_from: string, _to: string): Promise<void> { throw new Error('not implemented'); }
-  async traverseGraph(_slug: string, _depth?: number) { throw new Error('not implemented'); }
+  async findByTitleFuzzy(_name: string, _dirPrefix?: string, _minSimilarity?: number): Promise<{ slug: string; similarity: number } | null> { return null; }
+  async traverseGraph(_slug: string, _depth?: number): Promise<any[]> { return []; }
+  async traversePaths(_slug: string, _opts?: any): Promise<any[]> { return []; }
+  async getBacklinkCounts(slugs: string[]): Promise<Map<string, number>> {
+    return new Map(slugs.map((slug) => [slug, (this.backlinks.get(slug) || []).length]));
+  }
+  async findOrphanPages(): Promise<Array<{ slug: string; title: string; domain: string | null }>> { return []; }
   async addTag(_slug: string, _tag: string): Promise<void> { throw new Error('not implemented'); }
   async removeTag(_slug: string, _tag: string): Promise<void> { throw new Error('not implemented'); }
   async getTags(_slug: string): Promise<string[]> { throw new Error('not implemented'); }
   async addTimelineEntry(_slug: string, _entry: TimelineInput): Promise<void> { throw new Error('not implemented'); }
+  async addTimelineEntriesBatch(_entries: any[]): Promise<number> { return 0; }
   async getTimeline(_slug: string, _opts?: TimelineOpts): Promise<TimelineEntry[]> { throw new Error('not implemented'); }
   async putRawData(_slug: string, _source: string, _data: object): Promise<void> { throw new Error('not implemented'); }
   async getRawData(_slug: string, _source?: string): Promise<RawData[]> { throw new Error('not implemented'); }
+  async getDreamVerdict(_filePath: string, _contentHash: string): Promise<any> { return null; }
+  async putDreamVerdict(_filePath: string, _contentHash: string, _verdict: any): Promise<void> { throw new Error('not implemented'); }
   async createVersion(_slug: string): Promise<PageVersion> { throw new Error('not implemented'); }
   async getVersions(_slug: string): Promise<PageVersion[]> { throw new Error('not implemented'); }
   async revertToVersion(_slug: string, _versionId: number): Promise<void> { throw new Error('not implemented'); }
@@ -136,6 +156,13 @@ class FakeEngine implements BrainEngine {
   async setConfig(_key: string, _value: string): Promise<void> { throw new Error('not implemented'); }
   async runMigration(_version: number, _sql: string): Promise<void> { throw new Error('not implemented'); }
   async getChunksWithEmbeddings(_slug: string): Promise<Chunk[]> { throw new Error('not implemented'); }
+  async executeRaw<T = Record<string, unknown>>(_sql: string, _params?: unknown[]): Promise<T[]> { return []; }
+  async addCodeEdges(_edges: any[]): Promise<number> { return 0; }
+  async deleteCodeEdgesForChunks(_chunkIds: number[]): Promise<void> { throw new Error('not implemented'); }
+  async getCallersOf(_qualifiedName: string, _opts?: any): Promise<any[]> { return []; }
+  async getCalleesOf(_qualifiedName: string, _opts?: any): Promise<any[]> { return []; }
+  async getEdgesByChunk(_chunkId: number, _opts?: any): Promise<any[]> { return []; }
+  async searchKeywordChunks(_query: string, _opts?: any): Promise<SearchResult[]> { return []; }
 }
 
 describe('graph expansion contract', () => {
@@ -155,7 +182,7 @@ describe('hybridSearch graph expansion', () => {
     const prev = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;
     try {
-      const results = await hybridSearch(new FakeEngine(), 'people connected to both Wingate and Lune', { limit: 10 });
+      const results = await hybridSearch(new FakeEngine() as unknown as BrainEngine, 'people connected to both Wingate and Lune', { limit: 10 });
       expect(results.map(r => r.slug)).toEqual(['projects/wingate', 'projects/lune']);
     } finally {
       if (prev !== undefined) process.env.OPENAI_API_KEY = prev;
@@ -186,7 +213,7 @@ describe('hybridSearch graph expansion', () => {
     const prev = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;
     try {
-      const results = await hybridSearch(new FakeEngine(), 'people connected to both Wingate and Lune', { limit: 10, graphDepth: 1 } as any);
+      const results = await hybridSearch(new FakeEngine() as unknown as BrainEngine, 'people connected to both Wingate and Lune', { limit: 10, graphDepth: 1 } as any);
       const slugs = results.map(r => r.slug);
       expect(slugs).toContain('people/chris-winig');
       expect(slugs).toContain('people/melissa-esposito');
@@ -202,8 +229,8 @@ describe('hybridSearch graph expansion', () => {
     const prev = process.env.OPENAI_API_KEY;
     delete process.env.OPENAI_API_KEY;
     try {
-      const depth1 = await hybridSearch(new FakeEngine(), 'people connected to both Wingate and Lune', { limit: 10, graphDepth: 1 } as any);
-      const depth2 = await hybridSearch(new FakeEngine(), 'people connected to both Wingate and Lune', { limit: 10, graphDepth: 2 } as any);
+      const depth1 = await hybridSearch(new FakeEngine() as unknown as BrainEngine, 'people connected to both Wingate and Lune', { limit: 10, graphDepth: 1 } as any);
+      const depth2 = await hybridSearch(new FakeEngine() as unknown as BrainEngine, 'people connected to both Wingate and Lune', { limit: 10, graphDepth: 2 } as any);
       expect(depth1.map(r => r.slug)).not.toContain('companies/shared-vendor');
       expect(depth2.map(r => r.slug)).toContain('companies/shared-vendor');
     } finally {

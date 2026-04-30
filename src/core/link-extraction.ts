@@ -1027,7 +1027,10 @@ export function resolvedEntityRefs(
 ): { name: string; slug: string; dir: string }[] {
   return extractResolvedLinks(content, sourceSlug, resolver)
     .map(slug => resolver.get(normalizeKey(slug)))
-    .filter((target): target is ResolvedLinkTarget => Boolean(target) && ['people', 'companies'].includes(target.dir))
+    .filter(
+      (target): target is ResolvedLinkTarget =>
+        !!target && (target.dir === 'people' || target.dir === 'companies'),
+    )
     .map(target => ({
       name: target.name,
       slug: target.slug.replace(/^(people|companies)\//, ''),

@@ -11,6 +11,8 @@ function mockResult(slug: string, score: number, chunk_text = 'text'): SearchRes
     title: slug,
     type: 'concept',
     chunk_source: 'compiled_truth',
+    chunk_id: Math.abs(slug.split('').reduce((n, ch) => ((n << 5) - n) + ch.charCodeAt(0), 0)),
+    chunk_index: 0,
     stale: false,
   };
 }

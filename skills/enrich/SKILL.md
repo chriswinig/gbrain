@@ -32,7 +32,7 @@ Enrich person and company pages from external sources. Scale effort to importanc
 - Every enriched page has compiled truth (State section) with inline citations
 - Every enriched page has a timeline with dated entries
 - Back-links are created bidirectionally
-- Tiered enrichment: Tier 1 (full), Tier 2 (medium), Tier 3 (minimal) based on notability
+- Tiered enrichment: Tier 1 (full), Tier 2 (medium), Tier 3 (minimal) based on filing relevance
 - No stubs: every new page has meaningful content from web search or existing brain context
 
 > **Filing rule:** Read `skills/_brain-filing-rules.md` before creating any new page.
@@ -81,7 +81,7 @@ Extract people, companies, concepts from the incoming signal.
 For each entity:
 - `gbrain search "name"` -- does a page already exist?
 - **If yes:** UPDATE path (add new signal, update compiled truth if material)
-- **If no:** CREATE path (check notability gate first, then create)
+- **If no:** CREATE path (check filing rules first, then create)
 
 ### Step 3: Extract signal from source
 
@@ -150,7 +150,7 @@ the raw data shows exactly what the API returned.
 
 #### CREATE path
 
-1. Check notability gate (see `skills/_brain-filing-rules.md`)
+1. Check `skills/_brain-filing-rules.md` before creating the page
 2. Check filing rules -- where does this entity go?
 3. Create page with the appropriate template (below)
 4. Fill compiled truth with citations
@@ -282,7 +282,7 @@ Timeline entries still need explicit `gbrain timeline-add` calls.
 - Name mismatch between brain and API = skip, flag for review
 - Joke profiles or obviously wrong data = save to raw, don't update page
 - Don't overwrite user-written assessments with API boilerplate
-- When in doubt: save raw data but don't update brain page
+- If uncertain, save raw data without updating the brain page
 
 ## Report Storage
 
