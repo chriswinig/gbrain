@@ -52,6 +52,10 @@ docs/                     Architecture docs
 ## Running tests
 
 ```bash
+# Recommended: full CI guard chain + tests (matches what CI runs)
+bun run test                      # privacy + jsonb + progress + wasm + typecheck + bun test
+
+# Just the test runner (skips CI guards)
 bun test                          # all tests (unit + E2E skipped without DB)
 bun test test/markdown.test.ts    # specific unit test
 
@@ -62,6 +66,31 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5434/gbrain_test bun run t
 # Or use your own Postgres / Supabase
 DATABASE_URL=postgresql://... bun run test:e2e
 ```
+
+Use `bun run test` before pushing. The guard chain catches: banned fork-name leaks
+(`scripts/check-privacy.sh`), `JSON.stringify(x)::jsonb` interpolation patterns
+(`scripts/check-jsonb-pattern.sh`), `\r` progress bleed to stdout
+(`scripts/check-progress-to-stdout.sh`), trailing-newline drift across tracked
+files (`scripts/check-trailing-newline.sh`), and silent fallback to recursive
+chunking in the compiled binary (`scripts/check-wasm-embedded.sh`).
+
+### Local CI gate (recommended before pushing, v0.23.1+)
+
+```bash
+bun run ci:local         # full gate: gitleaks + unit + ALL 29 E2E files (sequential)
+bun run ci:local:diff    # gate with diff-aware E2E selector
+bun run ci:select-e2e    # print which E2E files the selector would run
+```
+
+`ci:local` spins up `pgvector/pgvector:pg16` + `oven/bun:1` via
+`docker-compose.ci.yml`, runs everything PR CI runs plus the full E2E suite, then
+tears down. Named volumes keep the install warm across runs (~16-20 min sequential
+E2E after the first cold pull). Requires Docker (Docker Desktop, OrbStack, or
+Colima) and `gitleaks` on host (`brew install gitleaks`). Override the postgres
+host port with `GBRAIN_CI_PG_PORT=5435 bun run ci:local` if 5434 collides.
+
+Fail-closed selector: an unmapped `src/` change runs all 29 E2E files. Hand-tune
+narrower mappings via `scripts/e2e-test-map.ts`.
 
 ## Building
 
@@ -94,6 +123,84 @@ See `docs/ENGINES.md` for the full guide. In short:
 4. Document in `docs/`
 
 The SQLite engine is designed and ready for implementation. See `docs/SQLITE_ENGINE.md`.
+
+## CONTRIBUTOR_MODE — turn on the dev loop
+
+gbrain captures retrieval traffic so you can replay real queries against
+your code changes before merging. **This is off by default** (production
+users get a quiet brain, no surprise data accumulation). Contributors turn
+it on with one shell rc line:
+
+```bash
+# In ~/.zshrc or ~/.bashrc:
+export GBRAIN_CONTRIBUTOR_MODE=1
+```
+
+That's it. Every `query` / `search` you (or agents pointed at your dev
+brain) run from that shell now writes a row to `eval_candidates`, and the
+[replay tool](#running-real-world-eval-benchmarks-touching-retrieval-code)
+has data to work against.
+
+What CONTRIBUTOR_MODE actually does:
+
+- Turns on `query`/`search` capture into the local `eval_candidates` table.
+  Without it the gate is closed and capture is a no-op.
+- That's all. PII scrubbing, retention, and replay are independent.
+
+Resolution order (most explicit wins):
+
+1. `eval.capture: true` in `~/.gbrain/config.json` → on
+2. `eval.capture: false` in `~/.gbrain/config.json` → off
+3. `GBRAIN_CONTRIBUTOR_MODE=1` → on
+4. otherwise → off
+
+Quick check that capture is actually running:
+
+```bash
+gbrain query "anything" >/dev/null
+psql $DATABASE_URL -c 'SELECT count(*) FROM eval_candidates'
+# (or `gbrain doctor` — surfaces silent capture failures cross-process)
+```
+
+To disable capture even with the env var set, write
+`{"eval": {"capture": false}}` to `~/.gbrain/config.json` — explicit config
+beats the env var both directions.
+
+## Running real-world eval benchmarks (touching retrieval code)
+
+If your PR touches retrieval — search ranking, RRF fusion, embeddings,
+intent classification, query expansion, source boost, or the `query` /
+`search` op handlers — run `gbrain eval replay` against a snapshot of
+real traffic before merging. Requires `CONTRIBUTOR_MODE` (above) so you
+have captured rows to replay against.
+
+Quick loop:
+
+```bash
+gbrain eval export --since 7d > baseline.ndjson    # snapshot before your change
+# ... make your change ...
+gbrain eval replay --against baseline.ndjson       # diff retrieval, get Jaccard@k
+```
+
+Three numbers come back: mean Jaccard@k between captured and current slug
+sets, top-1 stability, and mean latency Δ. The replay tool flags the worst
+regressions so you can eyeball whether the change is hurting real queries.
+
+Trigger paths (rerun if your diff touches any of these):
+
+- `src/core/search/hybrid.ts`
+- `src/core/search/source-boost.ts`, `sql-ranking.ts`
+- `src/core/search/intent.ts`, `expansion.ts`, `dedup.ts`
+- `src/core/embedding.ts`
+- `src/core/operations.ts` (query / search handlers)
+- `src/core/postgres-engine.ts` / `pglite-engine.ts` (searchKeyword /
+  searchVector SQL)
+
+See [`docs/eval-bench.md`](./docs/eval-bench.md) for the full guide
+including CI integration, hand-crafted NDJSON corpora (so a fresh checkout
+without captured data can still replay), and cost considerations. The
+NDJSON wire format is documented in
+[`docs/eval-capture.md`](./docs/eval-capture.md).
 
 ## Welcome PRs
 

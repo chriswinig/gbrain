@@ -107,6 +107,27 @@ export class InstallError extends Error {
   }
 }
 
+/**
+ * UninstallError — raised by planUninstall / applyUninstall.
+ * Mirrors InstallError's shape so callers can treat the two uniformly.
+ */
+export class UninstallError extends Error {
+  constructor(
+    message: string,
+    public code:
+      | 'lock_held'
+      | 'bundle_error'
+      | 'target_missing'
+      | 'unknown_skill'
+      | 'user_added_slug'      // slug not in cumulative-slugs receipt (D8)
+      | 'locally_modified'     // file content diverged from bundle (D11)
+      | 'managed_block_missing',
+  ) {
+    super(message);
+    this.name = 'UninstallError';
+  }
+}
+
 const DEFAULT_LOCK_STALE_MS = 10 * 60 * 1000; // 10 minutes
 
 // ---------------------------------------------------------------------------
@@ -238,15 +259,57 @@ function releaseLock(workspace: string): void {
 const MANAGED_BEGIN = '<!-- gbrain:skillpack:begin -->';
 const MANAGED_END = '<!-- gbrain:skillpack:end -->';
 
-export function buildManagedBlock(manifest: BundleManifest, slugs: string[]): string {
+// Receipt comment embedded inside the fence on every write. Lets the
+// next install distinguish "row gbrain installed previously" from
+// "row a user hand-added inside the fence." Format is intentionally
+// regex-friendly.
+//
+//   <!-- gbrain:skillpack:manifest cumulative-slugs="a,b,c" version="0.19.0" -->
+//
+// Sorted, comma-separated slug list. version is the gbrain version
+// that wrote this receipt.
+const RECEIPT_RE =
+  /<!-- gbrain:skillpack:manifest cumulative-slugs="([^"]*)" version="([^"]*)" -->/;
+
+function buildReceipt(cumulativeSlugs: string[], version: string): string {
+  const sorted = [...cumulativeSlugs].sort();
+  return `<!-- gbrain:skillpack:manifest cumulative-slugs="${sorted.join(',')}" version="${version}" -->`;
+}
+
+/**
+ * Parse the receipt comment from a managed block. Returns null if no
+ * receipt is present (pre-v0.19 fences). The slug list is split on
+ * comma; an empty string returns an empty list.
+ */
+export function parseReceipt(resolverContent: string): { cumulativeSlugs: string[]; version: string } | null {
+  const beginIdx = resolverContent.indexOf(MANAGED_BEGIN);
+  const endIdx = resolverContent.indexOf(MANAGED_END);
+  if (beginIdx === -1 || endIdx === -1 || endIdx <= beginIdx) return null;
+  const block = resolverContent.slice(beginIdx, endIdx);
+  const m = RECEIPT_RE.exec(block);
+  if (!m) return null;
+  const slugs = m[1].length === 0 ? [] : m[1].split(',');
+  return { cumulativeSlugs: slugs, version: m[2] };
+}
+
+export function buildManagedBlock(
+  manifest: BundleManifest,
+  slugs: string[],
+  cumulativeSlugs?: string[],
+): string {
   const sorted = [...slugs].sort();
   const rows = sorted.map(
     slug => `| "${slug}" | \`skills/${slug}/SKILL.md\` |`,
   );
+  // Default cumulative = the rendered slug set when caller didn't
+  // pass one explicitly (kept backward-compatible with older callers
+  // that don't yet thread the cumulative set through).
+  const receipt = buildReceipt(cumulativeSlugs ?? sorted, manifest.version);
   return [
     MANAGED_BEGIN,
     '',
     `<!-- Installed by gbrain ${manifest.version} — do not hand-edit between markers. -->`,
+    receipt,
     '',
     '| Trigger | Skill |',
     '|---------|-------|',
@@ -339,15 +402,24 @@ export function applyInstall(
       });
     }
 
-    // Managed block update
+    // Managed block update.
+    //
+    // installedSlugs = slugs we just wrote in THIS call.
+    // bundleSlugs    = the FULL bundle manifest's slug list (always
+    //                  populated; used for the install-all prune path).
+    // isInstallAll   = caller passed --all (no specific skillSlug).
     const installedSlugs = opts.skillSlug
       ? [opts.skillSlug]
       : plan.manifest.skills.map(pathSlug);
+    const bundleSlugs = plan.manifest.skills.map(pathSlug);
+    const isInstallAll = !opts.skillSlug;
     const managedBlock = applyManagedBlock(
       plan.targetWorkspace,
       plan.targetSkillsDir,
       plan.manifest,
       installedSlugs,
+      bundleSlugs,
+      isInstallAll,
       opts.dryRun ?? false,
     );
 
@@ -371,6 +443,8 @@ function applyManagedBlock(
   skillsDir: string,
   manifest: BundleManifest,
   installedSlugs: string[],
+  bundleSlugs: string[],
+  isInstallAll: boolean,
   dryRun: boolean,
 ): ManagedBlockResult {
   // Prefer skills-dir resolver; fall back to workspace-root resolver.
@@ -383,11 +457,75 @@ function applyManagedBlock(
     };
   }
   const existing = readFileSync(resolver, 'utf-8');
-  // Merge with any slugs already present in the managed block so
-  // repeated single-skill installs accumulate rather than overwrite.
-  const priorSlugs = extractManagedSlugs(existing);
-  const merged = Array.from(new Set([...priorSlugs, ...installedSlugs]));
-  const newBlock = buildManagedBlock(manifest, merged);
+
+  // Step 1: figure out what gbrain previously installed into this fence.
+  //   - If receipt is present, trust it as the cumulative-slug history.
+  //   - If receipt is absent (pre-v0.19 fence), fall back to the rows
+  //     currently in the fence — they were ALL gbrain-written before
+  //     the receipt feature existed, so trust them as the prior set.
+  const receipt = parseReceipt(existing);
+  const priorCumulativeSlugs =
+    receipt !== null
+      ? new Set(receipt.cumulativeSlugs)
+      : new Set(extractManagedSlugs(existing));
+
+  // Step 2: compute the new cumulative slug set.
+  //   - Single-skill install: union(prior, installed). Per-skill
+  //     installs accumulate; the documented v0.18 behavior.
+  //   - Install-all: prune slugs no longer in the bundle. Renamed
+  //     and removed skills leave the cumulative set ONLY via this
+  //     path. (Single-skill never prunes — it would regress
+  //     cumulative semantics for unrelated skills.)
+  //
+  // We track `prunedSlugs` separately so the unknown-row detector
+  // (Step 3) doesn't re-resurrect slugs we just intentionally removed.
+  const newCumulative = new Set(priorCumulativeSlugs);
+  for (const s of installedSlugs) newCumulative.add(s);
+  const prunedSlugs = new Set<string>();
+  if (isInstallAll) {
+    const bundleSet = new Set(bundleSlugs);
+    for (const s of [...newCumulative]) {
+      if (!bundleSet.has(s)) {
+        newCumulative.delete(s);
+        prunedSlugs.add(s);
+      }
+    }
+  }
+
+  // Step 3: detect unknown rows. A row inside the fence whose slug
+  // is NOT in newCumulative AND NOT in bundleSlugs AND NOT in the
+  // intentionally-pruned set is something gbrain never wrote: a user
+  // hand-add, a typo, or stale debris from an unknown bundle.
+  // Preserve it (do not destroy data) and emit a single stderr
+  // warning per slug instructing the agent to investigate.
+  const existingRowSlugs = extractManagedSlugs(existing);
+  const bundleSet = new Set(bundleSlugs);
+  const unknownSlugs: string[] = [];
+  // Skip the unknown-row check on the very first v0.19 install (no
+  // receipt yet). All existing rows are presumed gbrain-written and
+  // captured into newCumulative via the fallback above; warning here
+  // would create false positives.
+  if (receipt !== null) {
+    for (const slug of existingRowSlugs) {
+      if (newCumulative.has(slug)) continue;
+      if (bundleSet.has(slug)) continue;
+      if (prunedSlugs.has(slug)) continue; // known prune, do not resurrect
+      unknownSlugs.push(slug);
+      // Re-add to newCumulative so the rebuild preserves the row.
+      newCumulative.add(slug);
+    }
+  }
+  for (const slug of unknownSlugs) {
+    console.error(
+      `[skillpack] unknown row in managed block: "${slug}" at skills/${slug}/SKILL.md — not in gbrain's installed set. Investigate: user-added skill, hand-edited fence, or typo?`,
+    );
+  }
+
+  // Step 4: write the new block. The visible row set is sorted
+  // newCumulative. The receipt comment carries the same set so the
+  // next install can do the same diff.
+  const cumulativeArr = [...newCumulative].sort();
+  const newBlock = buildManagedBlock(manifest, cumulativeArr, cumulativeArr);
   const updated = updateManagedBlock(existing, newBlock);
   if (updated === existing) {
     return { resolverFile: resolver, applied: false, skippedReason: 'no_change' };
@@ -457,4 +595,307 @@ export function diffSkill(
     });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Uninstall (v0.25.1, D6 + D8 + D11)
+// ---------------------------------------------------------------------------
+
+/**
+ * `gbrain skillpack uninstall <name>` is the inverse of install. Two
+ * data-loss safeguards mirror install's existing posture:
+ *
+ *   D8 (refuse-and-warn for user-added rows):
+ *     If the slug isn't in the managed-block's cumulative-slugs receipt,
+ *     gbrain didn't install it; gbrain won't uninstall it either. Exit
+ *     1 with a message instructing the user to remove it manually.
+ *
+ *   D11 (content-hash guard, symmetric to install's
+ *   skipped_locally_modified):
+ *     Before removing each installed file, hash it against the bundle's
+ *     original. If they diverge, the user has hand-edited the file —
+ *     refuse-and-warn unless `--overwrite-local` is passed. Same
+ *     escape hatch as install, same trust contract.
+ *
+ * The managed block is rebuilt with the slug dropped from
+ * cumulative-slugs. Other rows (other installed skills, user-added
+ * unknown rows) are preserved.
+ */
+export type UninstallFileOutcome =
+  | 'removed'
+  | 'kept_locally_modified'
+  | 'absent';
+
+export interface UninstallFileResult {
+  target: string;
+  outcome: UninstallFileOutcome;
+  /** Bundle source path (for diff context); empty when the file is absent. */
+  source: string;
+  sharedDep: boolean;
+}
+
+export interface UninstallResult {
+  dryRun: boolean;
+  files: UninstallFileResult[];
+  managedBlock: ManagedBlockResult;
+  summary: {
+    removed: number;
+    keptLocallyModified: number;
+    absent: number;
+  };
+}
+
+export interface UninstallOptions {
+  /** Absolute path to the target workspace (above skills/). */
+  targetWorkspace: string;
+  /** Absolute path to the target skills directory. */
+  targetSkillsDir: string;
+  /** Gbrain repo root (source-of-truth bundle). */
+  gbrainRoot: string;
+  /** Required: a single skill slug. v0.25.1 has no --all uninstall. */
+  skillSlug: string;
+  /** Bypass D11 content-hash guard and remove locally-modified files. */
+  overwriteLocal?: boolean;
+  /** Dry-run: validate + report; no writes. */
+  dryRun?: boolean;
+  /** Forcibly proceed even when a stale lockfile exists. */
+  forceUnlock?: boolean;
+  /** Override the lock stale threshold (ms). Tests use this. */
+  lockStaleMs?: number;
+}
+
+/**
+ * applyUninstall — single inverse of applyInstall.
+ *
+ * Steps:
+ *   1. Acquire the workspace lockfile (same gate as install).
+ *   2. D8 check — read managed block; verify slug is in cumulative-slugs.
+ *      If user-added, throw UninstallError(user_added_slug).
+ *   3. Enumerate the bundle's files for this skill (NOT shared_deps —
+ *      uninstall scopes to the skill dir; shared_deps are kept since
+ *      other skills may rely on them).
+ *   4. D11 check — for each existing target file, hash against bundle.
+ *      Skip removal for divergent files unless overwriteLocal=true.
+ *   5. Remove files (or skip per outcome). Empty parent dirs are NOT
+ *      pruned automatically; that's a v0.26+ enhancement.
+ *   6. Rebuild managed block with the slug dropped from cumulative-slugs.
+ *   7. Release lock.
+ */
+export function applyUninstall(opts: UninstallOptions): UninstallResult {
+  const shouldLock = !opts.dryRun;
+  if (shouldLock) {
+    acquireLock(opts.targetWorkspace, opts as InstallOptions);
+  }
+
+  try {
+    // ── Step 2: D8 — receipt-presence check ────────────────────────
+    const resolver =
+      findResolverFile(opts.targetSkillsDir) ??
+      findResolverFile(opts.targetWorkspace);
+    if (!resolver) {
+      throw new UninstallError(
+        `No managed block (RESOLVER.md / AGENTS.md) at ${opts.targetSkillsDir} or ${opts.targetWorkspace}; nothing to uninstall.`,
+        'managed_block_missing',
+      );
+    }
+    const resolverContent = readFileSync(resolver, 'utf-8');
+    const receipt = parseReceipt(resolverContent);
+    if (!receipt) {
+      // Pre-v0.19 fence with no receipt: every existing row is presumed
+      // gbrain-installed. Trust it, but warn.
+      const existingRowSlugs = extractManagedSlugs(resolverContent);
+      if (!existingRowSlugs.includes(opts.skillSlug)) {
+        throw new UninstallError(
+          `Skill '${opts.skillSlug}' is not in the managed block. Either it was never installed by gbrain, or the slug is mistyped. Inspect ${resolver} and the skills/${opts.skillSlug}/ directory before retrying.`,
+          'unknown_skill',
+        );
+      }
+      // Otherwise proceed; we'll write a fresh receipt on the way out.
+    } else if (!receipt.cumulativeSlugs.includes(opts.skillSlug)) {
+      // D8 — slug IS NOT in the receipt's cumulative set. Either
+      // user-added (not gbrain's row) or the slug doesn't exist at all.
+      // Either way, refuse-and-warn.
+      throw new UninstallError(
+        `Skill '${opts.skillSlug}' is not in gbrain's installed set (cumulative-slugs receipt has no record of it). gbrain refuses to uninstall what it didn't install. If you hand-added this row to ${resolver}, remove it manually. If the slug is mistyped, run \`gbrain skillpack list\` to see what's installed.`,
+        'user_added_slug',
+      );
+    }
+
+    // ── Step 3: enumerate bundle entries for this skill ───────────
+    const manifest = loadBundleManifest(opts.gbrainRoot);
+    // Scope to the skill itself; do NOT include shared_deps — other
+    // installed skills depend on them. shared_dep cleanup is a separate
+    // operation (e.g., on the last uninstall of the last skill).
+    const entries = enumerateBundle({
+      gbrainRoot: opts.gbrainRoot,
+      skillSlug: opts.skillSlug,
+      manifest,
+    }).filter(e => !e.sharedDep);
+
+    if (entries.length === 0) {
+      throw new UninstallError(
+        `Skill '${opts.skillSlug}' has no bundle entries — likely an unknown slug or stale receipt. Verify with \`gbrain skillpack list\`.`,
+        'unknown_skill',
+      );
+    }
+
+    // ── Step 4: D11 content-hash pre-scan ─────────────────────────
+    // Atomic refusal contract: do NOT unlink ANY file until we've
+    // confirmed every file is removable. Otherwise a divergence on
+    // file 5/N would leave files 1..4 already gone — half-uninstalled.
+    const fileChecks: Array<{
+      entry: BundleEntry;
+      target: string;
+      kind: 'identical' | 'modified' | 'absent';
+    }> = [];
+    const blockedByLocalMod: string[] = [];
+
+    for (const entry of entries) {
+      const target = join(opts.targetSkillsDir, entry.relTarget);
+      if (!existsSync(target)) {
+        fileChecks.push({ entry, target, kind: 'absent' });
+        continue;
+      }
+      let identical = false;
+      try {
+        const a = readFileSync(entry.source);
+        const b = readFileSync(target);
+        identical = a.equals(b);
+      } catch {
+        identical = false;
+      }
+      if (identical) {
+        fileChecks.push({ entry, target, kind: 'identical' });
+      } else {
+        fileChecks.push({ entry, target, kind: 'modified' });
+        if (!opts.overwriteLocal) blockedByLocalMod.push(target);
+      }
+    }
+
+    // Refuse loudly BEFORE any filesystem mutation if anything blocked.
+    if (blockedByLocalMod.length > 0) {
+      throw new UninstallError(
+        `Refusing to uninstall '${opts.skillSlug}': ${blockedByLocalMod.length} file(s) differ from the bundle (you've hand-edited them):\n  ${blockedByLocalMod.join('\n  ')}\n\nPass --overwrite-local to drop your edits, or run \`gbrain skillpack diff ${opts.skillSlug}\` to inspect first.`,
+        'locally_modified',
+      );
+    }
+
+    // ── Step 5: remove (now safe; nothing blocked or all overridden) ──
+    const files: UninstallFileResult[] = [];
+    for (const { entry, target, kind } of fileChecks) {
+      let outcome: UninstallFileOutcome;
+      if (kind === 'absent') {
+        outcome = 'absent';
+      } else {
+        // Either identical (safe to remove) or modified-with-overwrite-local.
+        outcome = 'removed';
+        if (!opts.dryRun) {
+          try {
+            unlinkSync(target);
+          } catch {
+            // File vanished between check and unlink — treat as already-gone.
+            outcome = 'absent';
+          }
+        }
+      }
+      files.push({
+        target,
+        source: entry.source,
+        outcome,
+        sharedDep: entry.sharedDep,
+      });
+    }
+
+    // ── Step 6: managed block rebuild ─────────────────────────────
+    // installedSlugs in the install path means "what we just wrote." For
+    // uninstall, we pass [] and a removedSlug to applyManagedBlockUninstall.
+    const managedBlock = applyManagedBlockUninstall(
+      opts.targetWorkspace,
+      opts.targetSkillsDir,
+      manifest,
+      opts.skillSlug,
+      opts.dryRun ?? false,
+    );
+
+    const summary = {
+      removed: files.filter(f => f.outcome === 'removed').length,
+      keptLocallyModified: files.filter(
+        f => f.outcome === 'kept_locally_modified',
+      ).length,
+      absent: files.filter(f => f.outcome === 'absent').length,
+    };
+
+    return { dryRun: opts.dryRun ?? false, files, managedBlock, summary };
+  } finally {
+    if (shouldLock) releaseLock(opts.targetWorkspace);
+  }
+}
+
+/**
+ * Mirror of applyManagedBlock for the uninstall path. Drops the
+ * removed slug from cumulative-slugs and rebuilds the block.
+ *
+ * Symmetric to install: rows for OTHER installed skills are preserved
+ * (still in cumulative-slugs); user-added unknown rows are preserved
+ * with a stderr warning (same logic as install).
+ */
+function applyManagedBlockUninstall(
+  workspace: string,
+  skillsDir: string,
+  manifest: BundleManifest,
+  removedSlug: string,
+  dryRun: boolean,
+): ManagedBlockResult {
+  const resolver =
+    findResolverFile(skillsDir) ?? findResolverFile(workspace);
+  if (!resolver) {
+    return {
+      resolverFile: '',
+      applied: false,
+      skippedReason: 'resolver_not_found',
+    };
+  }
+  const existing = readFileSync(resolver, 'utf-8');
+
+  // Step 1: read prior cumulative set.
+  const receipt = parseReceipt(existing);
+  const priorCumulativeSlugs =
+    receipt !== null
+      ? new Set(receipt.cumulativeSlugs)
+      : new Set(extractManagedSlugs(existing));
+
+  // Step 2: drop the removed slug.
+  const newCumulative = new Set(priorCumulativeSlugs);
+  newCumulative.delete(removedSlug);
+
+  // Step 3: preserve user-added unknown rows (same posture as install).
+  // Skip on pre-v0.19 fences (no receipt).
+  const bundleSlugs = manifest.skills.map(pathSlug);
+  const bundleSet = new Set(bundleSlugs);
+  const existingRowSlugs = extractManagedSlugs(existing);
+  const unknownSlugs: string[] = [];
+  if (receipt !== null) {
+    for (const slug of existingRowSlugs) {
+      if (slug === removedSlug) continue; // we just dropped this
+      if (newCumulative.has(slug)) continue;
+      if (bundleSet.has(slug)) continue;
+      unknownSlugs.push(slug);
+      newCumulative.add(slug); // preserve
+    }
+  }
+  for (const slug of unknownSlugs) {
+    console.error(
+      `[skillpack] unknown row in managed block: "${slug}" at skills/${slug}/SKILL.md — not in gbrain's installed set. Investigate: user-added skill, hand-edited fence, or typo?`,
+    );
+  }
+
+  // Step 4: write the new block.
+  const cumulativeArr = [...newCumulative].sort();
+  const newBlock = buildManagedBlock(manifest, cumulativeArr, cumulativeArr);
+  const updated = updateManagedBlock(existing, newBlock);
+  if (updated === existing) {
+    return { resolverFile: resolver, applied: false, skippedReason: 'no_change' };
+  }
+  if (!dryRun) writeAtomic(resolver, updated);
+  return { resolverFile: resolver, applied: true };
 }
