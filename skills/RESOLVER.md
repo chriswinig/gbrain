@@ -27,6 +27,7 @@ This is the dispatcher. Skills are the implementation. **Read the skill file bef
 
 | Trigger | Skill |
 |---------|-------|
+| "process this book", "ingest this PDF", "summarize this book", "watch this video", "process this YouTube", "save this podcast", "what is in this screenshot", "check out this repo" | `skills/media-ingest/SKILL.md` |
 | User shares a link, article, tweet, or idea | `skills/idea-ingest/SKILL.md` |
 | Video, audio, PDF, book, YouTube, screenshot | `skills/media-ingest/SKILL.md` |
 | Meeting transcript received | `skills/meeting-ingestion/SKILL.md` |
@@ -109,20 +110,20 @@ These apply to ALL brain-writing skills:
 
 | Trigger | Skill |
 |---------|-------|
-| "personalized version of this book" | `skills/book-mirror/SKILL.md` |
+| "personalized version of this book", "mirror this book", "two-column book analysis", "apply this book to my life", "how does this book apply to me" | `skills/book-mirror/SKILL.md` |
+| "enrich this article", "enrich brain pages", "batch enrich", "make brain pages useful", "raw content but no executive summary" | `skills/article-enrichment/SKILL.md` |
+| "strategic reading", "read this through the lens of", "apply this to my problem", "what can I learn from this about", "extract a playbook from" | `skills/strategic-reading/SKILL.md` |
+| "concept synthesis", "synthesize my concepts", "find patterns across my notes", "build my intellectual map", "trace idea evolution" | `skills/concept-synthesis/SKILL.md` |
+| "perplexity research", "what's new about", "current state of", "web research", "web research pass", "what changed about" | `skills/perplexity-research/SKILL.md` |
+| "crawl my archive", "find gold in my archive", "archive crawler", "scan my dropbox for", "mine my old files for", "allow-listed paths" | `skills/archive-crawler/SKILL.md` |
+| "verify this academic claim", "check this study", "academic verify", "validate citation", "is this study real", "has it been replicated", "trace it to the source data", "Retraction Watch" | `skills/academic-verify/SKILL.md` |
+| "make pdf from brain", "brain pdf", "convert brain page to pdf", "publish this page as pdf", "export brain page", "clean PDF" | `skills/brain-pdf/SKILL.md` |
+| "voice note", "ingest this voice memo", "transcribe and file", "voice note ingest", "save this audio note", "audio message" | `skills/voice-note-ingest/SKILL.md` |
 
-| "enrich this article" | `skills/article-enrichment/SKILL.md` |
 
-| "strategic reading" | `skills/strategic-reading/SKILL.md` |
 
-| "concept synthesis" | `skills/concept-synthesis/SKILL.md` |
 
-| "perplexity research" | `skills/perplexity-research/SKILL.md` |
 
-| "crawl my archive" | `skills/archive-crawler/SKILL.md` |
 
-| "verify this academic claim" | `skills/academic-verify/SKILL.md` |
 
-| "make pdf from brain" | `skills/brain-pdf/SKILL.md` |
 
-| "voice note" | `skills/voice-note-ingest/SKILL.md` |
