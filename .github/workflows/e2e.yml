@@ -66,8 +66,10 @@ jobs:
         with:
           bun-version: latest
       - run: bun install
-      - name: Install OpenClaw
-        run: npm install -g openclaw@2026.4.9
+      - name: Install Socket Firewall
+        run: npm install -g sfw@2.0.4
+      - name: Install OpenClaw through Socket Firewall
+        run: sfw npm install -g openclaw@2026.4.9
       - name: Configure OpenClaw MCP
         run: |
           mkdir -p ~/.openclaw
