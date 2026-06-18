@@ -69,15 +69,16 @@ jobs:
       - name: Install Socket Firewall
         run: npm install -g sfw@2.0.4
       - name: Install OpenClaw through Socket Firewall
+        timeout-minutes: 12
         run: |
           npm config set fetch-retries 5
           npm config set fetch-retry-mintimeout 20000
           npm config set fetch-retry-maxtimeout 120000
           for attempt in 1 2 3; do
-            if sfw npm install -g openclaw@2026.4.9; then
+            if timeout 180s sfw npm install -g openclaw@2026.4.9; then
               exit 0
             fi
-            echo "OpenClaw install failed on attempt ${attempt}; retrying after npm/socket transient failure..."
+            echo "OpenClaw install failed or timed out on attempt ${attempt}; retrying after npm/socket transient failure..."
             sleep $((attempt * 20))
           done
           echo "OpenClaw install failed after 3 attempts"
