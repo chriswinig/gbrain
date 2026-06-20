@@ -1,27 +1,36 @@
+---
+name: ingest
+description: Route content to specialized ingestion skills. Detects input type and delegates.
+triggers:
+  - "ingest this"
+  - "save this to brain"
+  - "process this meeting"
+tools:
+  - search
+  - get_page
+  - put_page
+  - add_link
+  - add_timeline_entry
+  - sync_brain
+mutating: true
+---
+
 # Ingest Skill
 
 Ingest meetings, articles, media, documents, and conversations into the brain.
 
 > **Filing rule:** Read `skills/_brain-filing-rules.md` before creating any new page.
 
-## Iron Law: Back-Linking (MANDATORY)
+## Contract
 
-Every mention of a person or company with a brain page MUST create a back-link
-FROM that entity's page TO the page mentioning them. An unlinked mention is a
-broken brain. See `skills/_brain-filing-rules.md` for format.
+- Shared quality rules follow `skills/conventions/quality.md` (citations, back-links, notability gate).
+- Raw sources are preserved for provenance via `gbrain files upload-raw` with automatic size routing.
+- State sections are rewritten with current best understanding, never appended to.
+- Entity detection fires on every inbound message; notable entities get pages or updates.
 
-## Citation Requirements (MANDATORY)
+## Phases
 
-Every fact written to a brain page must carry an inline `[Source: ...]` citation.
-
-- **User's statements:** `[Source: User, {context}, YYYY-MM-DD]`
-- **Meeting data:** `[Source: Meeting "{title}", YYYY-MM-DD]`
-- **Email/message:** `[Source: email from {name} re: {subject}, YYYY-MM-DD]`
-- **Web content:** `[Source: {publication}, {URL}, YYYY-MM-DD]`
-- **Social media:** `[Source: X/@handle, YYYY-MM-DD](URL)` (include link)
-- **Synthesis:** `[Source: compiled from {sources}]`
-
-## Workflow
+> **Router note:** This skill is a router. For specialized ingestion, see: idea-ingest, media-ingest, meeting-ingestion.
 
 1. **Parse the source.** Extract people, companies, dates, and events from the input.
 2. **For each entity mentioned:**
@@ -238,6 +247,32 @@ up 100 bad pages is enormous.
 - Source attribution: every timeline entry includes [Source: ...] citation
 - Back-links: every entity mention creates a back-link (Iron Law)
 - Filing: file by primary subject, not format or source (see filing rules)
+
+## Anti-Patterns
+
+- **Appending to State sections.** State is rewritten with the current best understanding on every update. Append-only State sections grow stale and contradictory.
+- **Ingesting without back-links.** An unlinked mention is a broken brain. Every entity mentioned must have a back-link from their page to the page mentioning them.
+- **Skipping raw source preservation.** Every ingested item must have its raw source preserved. A brain page without provenance is unverifiable.
+- **Bulk processing without sample test.** Test on 3-5 items first. Fix quality issues in the approach, not via one-off patches.
+- **Paraphrasing the user's original thinking.** The user's exact language IS the insight. Capture verbatim phrasing for ideas, theses, and frameworks.
+
+## Output Format
+
+```
+INGESTED: [title]
+==================
+
+Page: [slug]
+Type: [person / company / meeting / media / concept]
+Source: [source description]
+
+Entities detected: N
+- [entity] -> [created / updated] ([slug])
+
+Back-links created: N
+Timeline entries: N
+Raw source: [preserved at path / uploaded to cloud]
+```
 
 ## Tools Used
 

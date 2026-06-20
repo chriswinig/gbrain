@@ -1,9 +1,11 @@
-import { readFileSync, readdirSync, statSync, existsSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
+import { readFileSync, readdirSync, statSync, lstatSync, existsSync, writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { join, relative, extname, basename, dirname } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
 import * as db from '../core/db.ts';
 import { humanSize } from '../core/file-resolver.ts';
+import { createProgress } from '../core/progress.ts';
+import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 
 /** Size threshold: files >= 100 MB use TUS resumable upload */
 const SIZE_THRESHOLD = 100 * 1024 * 1024;
@@ -102,7 +104,7 @@ async function listFiles(slug?: string) {
   const sql = db.getConnection();
   let rows;
   if (slug) {
-    rows = await sql`SELECT * FROM files WHERE page_slug = ${slug} ORDER BY filename`;
+    rows = await sql`SELECT * FROM files WHERE page_slug = ${slug} ORDER BY filename LIMIT 100`;
   } else {
     rows = await sql`SELECT * FROM files ORDER BY page_slug, filename LIMIT 100`;
   }
@@ -240,9 +242,10 @@ async function uploadRaw(args: string[]) {
       uploaded: new Date().toISOString(),
       ...(fileType ? { type: fileType } : {}),
     });
-    // Write pointer next to the page that references it
-    pointerPath = `${pageSlug}/${filename}.redirect.yaml`;
-    console.error(`Pointer: ${pointerPath}`);
+    // Write pointer next to the original file
+    pointerPath = filePath + '.redirect.yaml';
+    writeFileSync(pointerPath, pointer);
+    console.error(`Pointer written: ${pointerPath}`);
   }
 
   // Record in DB
@@ -250,7 +253,7 @@ async function uploadRaw(args: string[]) {
   await sql`
     INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
     VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${'sha256:' + hash},
-            ${JSON.stringify({ type: fileType, upload_method: method })}::jsonb)
+            ${sql.json({ type: fileType, upload_method: method })})
     ON CONFLICT (storage_path) DO UPDATE SET
       content_hash = EXCLUDED.content_hash,
       size_bytes = EXCLUDED.size_bytes,
@@ -305,13 +308,14 @@ async function syncFiles(dir?: string) {
   let uploaded = 0;
   let skipped = 0;
 
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  progress.start('files.sync', files.length);
+
   for (let i = 0; i < files.length; i++) {
     const filePath = files[i];
     const relativePath = relative(dir, filePath);
 
-    if ((i + 1) % 50 === 0 || i === files.length - 1) {
-      process.stdout.write(`\r  ${i + 1}/${files.length} processed, ${uploaded} uploaded, ${skipped} skipped`);
-    }
+    progress.tick(1);
 
     const hash = fileHash(filePath);
     const filename = basename(filePath);
@@ -342,12 +346,14 @@ async function syncFiles(dir?: string) {
     uploaded++;
   }
 
-  console.log(`\n\nFiles sync complete: ${uploaded} uploaded, ${skipped} skipped (unchanged)`);
+  progress.finish();
+  // Stdout summary preserved for scripts/tests that grep for it.
+  console.log(`Files sync complete: ${uploaded} uploaded, ${skipped} skipped (unchanged)`);
 }
 
 async function verifyFiles() {
   const sql = db.getConnection();
-  const rows = await sql`SELECT * FROM files ORDER BY storage_path`;
+  const rows = await sql`SELECT * FROM files ORDER BY storage_path LIMIT 1000`;
 
   if (rows.length === 0) {
     console.log('No files to verify.');
@@ -415,7 +421,7 @@ async function mirrorFiles(args: string[]) {
   // Write .supabase marker
   const marker = stringify({
     synced_at: new Date().toISOString(),
-    bucket: config.storage.bucket || 'brain-files',
+    bucket: (config.storage as { bucket?: string })?.bucket || 'brain-files',
     prefix: basename(dir) + '/',
     file_count: uploaded,
   });
@@ -525,7 +531,14 @@ async function restoreFiles(args: string[]) {
     for (const entry of readdirSync(d)) {
       if (entry.startsWith('.')) continue;
       const full = join(d, entry);
-      if (statSync(full).isDirectory()) findRedirects(full);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue; // Broken symlink or permission error
+      }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) findRedirects(full);
       else if (entry.endsWith('.redirect.yaml') || entry.endsWith('.redirect')) redirectFiles.push(full);
     }
   }
@@ -570,7 +583,14 @@ async function cleanFiles(args: string[]) {
     for (const entry of readdirSync(d)) {
       if (entry.startsWith('.')) continue;
       const full = join(d, entry);
-      if (statSync(full).isDirectory()) findAndClean(full);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue; // Broken symlink or permission error
+      }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) findAndClean(full);
       else if (entry.endsWith('.redirect.yaml') || entry.endsWith('.redirect')) { unlinkSync(full); cleaned++; }
     }
   }
@@ -589,7 +609,14 @@ async function filesStatus(args: string[]) {
       if (entry.startsWith('.') && entry !== '.supabase') continue;
       const full = join(d, entry);
       if (entry === '.supabase') { mirrored++; continue; }
-      if (statSync(full).isDirectory()) scan(full);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue; // Broken symlink or permission error
+      }
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) scan(full);
       else if (entry.endsWith('.redirect.yaml') || entry.endsWith('.redirect')) redirected++;
       else if (!entry.endsWith('.md')) local++;
     }
@@ -608,15 +635,22 @@ async function filesStatus(args: string[]) {
   }
 }
 
-function collectFiles(dir: string): string[] {
+export function collectFiles(dir: string): string[] {
   const files: string[] = [];
 
   function walk(d: string) {
     for (const entry of readdirSync(d)) {
       if (entry.startsWith('.')) continue;
+      if (entry === 'node_modules') continue;
 
       const full = join(d, entry);
-      const stat = statSync(full);
+      let stat;
+      try {
+        stat = lstatSync(full);
+      } catch {
+        continue; // Broken symlink or permission error
+      }
+      if (stat.isSymbolicLink()) continue;
 
       if (stat.isDirectory()) {
         walk(full);

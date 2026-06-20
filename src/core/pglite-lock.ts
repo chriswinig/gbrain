@@ -14,13 +14,11 @@
  *   try { ... } finally { await releaseLock(lock); }
  */
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, statSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from 'fs';
 import { join } from 'path';
 
 const LOCK_DIR_NAME = '.gbrain-lock';
 const LOCK_FILE = 'lock';
-const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes — embed jobs can be long
-
 export interface LockHandle {
   lockDir: string;
   acquired: boolean;
@@ -59,6 +57,10 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
     return { lockDir: '', acquired: true };
   }
 
+  // `lockDir` being set implies `dataDir` is set (see getLockDir), but TS
+  // can't derive that across helper boundaries.
+  mkdirSync(dataDir as string, { recursive: true });
+
   const timeoutMs = opts?.timeoutMs ?? 30_000; // 30 second default timeout
   const startTime = Date.now();
 
@@ -75,10 +77,6 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
         if (!isProcessAlive(lockPid)) {
           // Stale lock — clean it up
           try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition, try again */ }
-        } else if (Date.now() - lockTime > STALE_THRESHOLD_MS) {
-          // Lock held for too long — assume stale (e.g., process hung)
-          // Still alive but probably stuck — force remove
-          try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* race condition */ }
         } else {
           // Lock is held by a live process — wait and retry
           await new Promise(r => setTimeout(r, 1000));

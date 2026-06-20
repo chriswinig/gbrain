@@ -2,6 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { importFile, importFromContent } from '../src/core/import-file.ts';
+import { buildPageResolver } from '../src/core/link-extraction.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 const TMP = join(import.meta.dir, '.tmp-import-test');
@@ -201,6 +202,7 @@ Same content.
         timeline: parsed.timeline,
         frontmatter: parsed.frontmatter,
         tags: parsed.tags.sort(),
+        outbound_links: [],
       }))
       .digest('hex');
 
@@ -243,6 +245,122 @@ Content here.
     expect(addCalls.length).toBe(2);
   });
 
+  test('reconciles outbound links from Obsidian wikilinks', async () => {
+    const filePath = join(TMP, 'wikilinks.md');
+    writeFileSync(filePath, `---
+type: concept
+title: Wikilink Source
+---
+
+Met [[Jane Doe]] and [[Acme Corp|Acme]] during the trip.
+`);
+
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      getTags: () => Promise.resolve([]),
+      getLinks: () => Promise.resolve([]),
+      listPages: () => Promise.resolve([
+        {
+          slug: 'people/jane-doe',
+          title: 'Jane Doe',
+          frontmatter: { aliases: ['Janie Doe'] },
+        },
+        {
+          slug: 'companies/acme-corp',
+          title: 'Acme Corp',
+          frontmatter: {},
+        },
+      ]),
+    });
+
+    await importFile(engine, filePath, 'concepts/wikilinks.md', { noEmbed: true });
+
+    const calls = (engine as any)._calls;
+    const addLinkCalls = calls.filter((c: any) => c.method === 'addLink');
+
+    expect(addLinkCalls).toHaveLength(2);
+    expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
+      ['concepts/wikilinks', 'people/jane-doe'],
+      ['concepts/wikilinks', 'companies/acme-corp'],
+    ]));
+  });
+
+  test('reconciles wikilinks using pages beyond the first listPages() page', async () => {
+    const filePath = join(TMP, 'wikilinks-paginated.md');
+    writeFileSync(filePath, `---
+type: concept
+title: Paginated Wikilink Source
+---
+
+Met [[Angelica Hernandez]] during the trip.
+`);
+
+    const firstPage = Array.from({ length: 100 }, (_, i) => ({
+      slug: `concepts/filler-${i + 1}`,
+      title: `Filler ${i + 1}`,
+      frontmatter: {},
+    }));
+
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      getTags: () => Promise.resolve([]),
+      getLinks: () => Promise.resolve([]),
+      listPages: ({ offset = 0, limit = 100 } = {}) => {
+        const all = [
+          ...firstPage,
+          { slug: 'people/angelica-hernandez', title: 'Angelica Hernandez', frontmatter: {} },
+        ];
+        return Promise.resolve(all.slice(offset, offset + limit));
+      },
+    });
+
+    await importFile(engine, filePath, 'concepts/wikilinks-paginated.md', { noEmbed: true });
+
+    const calls = (engine as any)._calls;
+    const addLinkCalls = calls.filter((c: any) => c.method === 'addLink');
+    expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
+      ['concepts/wikilinks-paginated', 'people/angelica-hernandez'],
+    ]));
+  });
+
+  test('uses provided resolver without fetching all pages again', async () => {
+    const filePath = join(TMP, 'wikilinks-prebuilt-resolver.md');
+    writeFileSync(filePath, `---
+type: concept
+title: Prebuilt Resolver Source
+---
+
+Met [[Angelica Hernandez]] during the trip.
+`);
+
+    let listPagesCalls = 0;
+    const engine = mockEngine({
+      getPage: () => Promise.resolve(null),
+      getTags: () => Promise.resolve([]),
+      getLinks: () => Promise.resolve([]),
+      listPages: () => {
+        listPagesCalls++;
+        return Promise.resolve([]);
+      },
+    });
+
+    const resolver = buildPageResolver([
+      { slug: 'people/angelica-hernandez', title: 'Angelica Hernandez', frontmatter: {} },
+    ]);
+
+    await importFile(engine, filePath, 'concepts/wikilinks-prebuilt-resolver.md', {
+      noEmbed: true,
+      resolver,
+    });
+
+    const calls = (engine as any)._calls;
+    const addLinkCalls = calls.filter((c: any) => c.method === 'addLink');
+    expect(addLinkCalls.map((call: any) => call.args.slice(0, 2))).toEqual(expect.arrayContaining([
+      ['concepts/wikilinks-prebuilt-resolver', 'people/angelica-hernandez'],
+    ]));
+    expect(listPagesCalls).toBe(0);
+  });
+
   test('chunks compiled_truth and timeline separately', async () => {
     const filePath = join(TMP, 'chunked.md');
     writeFileSync(filePath, `---
@@ -252,7 +370,7 @@ title: Chunked
 
 This is compiled truth content that should be chunked as compiled_truth source.
 
----
+<!-- timeline -->
 
 - 2024-01-01: This is timeline content that should be chunked as timeline source.
 `);

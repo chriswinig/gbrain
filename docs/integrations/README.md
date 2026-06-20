@@ -24,7 +24,9 @@ Next query is smarter (the compounding effect)
 ### Self-Installing Recipes
 
 These are integration recipes your agent can set up for you. Run
-`gbrain integrations` to see what's available and their status.
+`gbrain integrations` to see what's available and their status, then use
+`gbrain integrations install <recipe-id>` to build the install payload your
+agent should follow.
 
 | Recipe | Category | Requires | What It Does | Setup Time |
 |--------|----------|----------|-------------|------------|
@@ -34,6 +36,7 @@ These are integration recipes your agent can set up for you. Run
 | [email-to-brain](../../recipes/email-to-brain.md) | Sense | credential-gateway | Gmail messages flow into entity pages via deterministic collector | 20 min |
 | [x-to-brain](../../recipes/x-to-brain.md) | Sense | — | Twitter timeline, mentions, keyword monitoring with deletion detection | 15 min |
 | [calendar-to-brain](../../recipes/calendar-to-brain.md) | Sense | credential-gateway | Google Calendar events become searchable daily brain pages | 20 min |
+| [telegram-transcript-to-brain](../../recipes/telegram-transcript-to-brain.md) | Sense | — | Hermes Telegram session transcripts become compiled-truth/timeline pages with dedupe state | 20 min |
 | [meeting-sync](../../recipes/meeting-sync.md) | Sense | — | Circleback meeting transcripts auto-import with attendee propagation | 15 min |
 
 ### Manual Integration Guides
@@ -62,8 +65,13 @@ secrets:                        # API keys and credentials needed
   - name: TWILIO_ACCOUNT_SID
     description: Twilio account SID
     where: https://console.twilio.com    # exact URL to get this key
-health_checks:                  # commands to verify the integration is working
-  - "curl -sf https://api.twilio.com/..."
+health_checks:                  # typed DSL to verify the integration is working
+  - type: http
+    url: "https://api.twilio.com/2010-04-01/Accounts/$TWILIO_ACCOUNT_SID.json"
+    auth: basic
+    auth_user: "$TWILIO_ACCOUNT_SID"
+    auth_token: "$TWILIO_AUTH_TOKEN"
+    label: "Twilio account"
 setup_time: 30 min              # estimated time to complete setup
 ---
 
@@ -73,6 +81,29 @@ setup_time: 30 min              # estimated time to complete setup
 **The recipe IS the installer.** Your agent (OpenClaw, Hermes, Claude Code) reads
 the markdown body and executes the setup steps. It asks you for API keys, validates
 each one, configures the integration, and runs a smoke test.
+
+Use the CLI to package that handoff cleanly:
+
+```bash
+gbrain integrations install email-to-brain
+gbrain integrations install email-to-brain --json
+```
+
+The install payload includes:
+- the selected recipe
+- dependency order
+- consolidated secret checklist
+- the full recipe body for the agent to execute
+
+### Recipe trust boundary
+
+Only recipes shipped inside the gbrain package itself (the `recipes/` directory in
+a source install, or the global install copy) are trusted. Recipes discovered at
+runtime from `$GBRAIN_RECIPES_DIR` or a cwd-local `./recipes/` are marked untrusted:
+they cannot run `command` health checks, cannot run `http` health checks (SSRF
+defense), and cannot use the deprecated string health_check form. Untrusted recipes
+can still use `env_exists` and `any_of` compositions. To ship a recipe that runs
+live checks, contribute it upstream so it becomes package-bundled.
 
 ## The Deterministic Collector Pattern
 

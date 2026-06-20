@@ -10,8 +10,12 @@
  *   gbrain check-backlinks fix --dry-run                  # preview fixes
  */
 
-import { readFileSync, writeFileSync, readdirSync, statSync, lstatSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, readdirSync, lstatSync, existsSync } from 'fs';
 import { join, relative, basename } from 'path';
+import { buildPageResolver, resolvedEntityRefs, type ResolvedLinkTarget } from '../core/link-extraction.ts';
+import { parseMarkdown } from '../core/markdown.ts';
+import { createProgress, startHeartbeat } from '../core/progress.ts';
+import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 
 interface BacklinkGap {
   /** The page that mentions the entity */
@@ -24,9 +28,14 @@ interface BacklinkGap {
   sourceTitle: string;
 }
 
-/** Extract entity references from markdown content (relative links to people/companies) */
-export function extractEntityRefs(content: string, pagePath: string): { name: string; slug: string; dir: string }[] {
+/** Extract entity references from markdown links and Obsidian wikilinks. */
+export function extractEntityRefs(
+  content: string,
+  pagePath: string,
+  resolver?: Map<string, ResolvedLinkTarget>,
+): { name: string; slug: string; dir: string }[] {
   const refs: { name: string; slug: string; dir: string }[] = [];
+
   // Match markdown links to brain pages: [Name](../people/slug.md) or [Name](../../companies/slug.md)
   const linkPattern = /\[([^\]]+)\]\(([^)]*(?:people|companies)\/([^)]+\.md))\)/g;
   let match;
@@ -37,6 +46,15 @@ export function extractEntityRefs(content: string, pagePath: string): { name: st
     const dir = fullPath.includes('people') ? 'people' : 'companies';
     refs.push({ name, slug, dir });
   }
+
+  if (!resolver) return refs;
+
+  for (const ref of resolvedEntityRefs(content, pagePath.replace(/\.md$/i, ''), resolver)) {
+    if (!refs.some(existing => existing.dir === ref.dir && existing.slug === ref.slug)) {
+      refs.push(ref);
+    }
+  }
+
   return refs;
 }
 
@@ -81,16 +99,22 @@ export function findBacklinkGaps(brainDir: string): BacklinkGap[] {
   }
   walk(brainDir);
 
-  // Build a lookup of existing pages by directory/slug
+  // Build lookups of existing pages by slug/title/alias
   const pagesBySlug = new Map<string, { path: string; content: string }>();
-  for (const page of allPages) {
+  const resolver = buildPageResolver(allPages.map(page => {
+    const parsed = parseMarkdown(page.content, page.relPath);
     const slug = page.relPath.replace('.md', '');
     pagesBySlug.set(slug, { path: page.path, content: page.content });
-  }
+    return {
+      slug,
+      title: parsed.title,
+      frontmatter: parsed.frontmatter,
+    };
+  }));
 
   // For each page, check entity references
   for (const page of allPages) {
-    const refs = extractEntityRefs(page.content, page.relPath);
+    const refs = extractEntityRefs(page.content, page.relPath, resolver);
     const sourceFilename = basename(page.relPath);
 
     for (const ref of refs) {
@@ -168,6 +192,54 @@ export function fixBacklinkGaps(brainDir: string, gaps: BacklinkGap[], dryRun: b
   return fixed;
 }
 
+export interface BacklinksOpts {
+  action: 'check' | 'fix';
+  dir: string;
+  dryRun?: boolean;
+}
+
+export interface BacklinksResult {
+  action: 'check' | 'fix';
+  gaps_found: number;
+  fixed: number;
+  pages_affected: number;
+  dryRun: boolean;
+}
+
+/**
+ * Library-level backlinks check/fix. Throws on validation errors; returns a
+ * structured result so Minions handlers + autopilot-cycle can surface counts.
+ * Safe to call from the worker — no process.exit.
+ */
+export async function runBacklinksCore(opts: BacklinksOpts): Promise<BacklinksResult> {
+  if (!['check', 'fix'].includes(opts.action)) {
+    throw new Error(`Invalid backlinks action "${opts.action}". Allowed: check, fix.`);
+  }
+  if (!existsSync(opts.dir)) {
+    throw new Error(`Directory not found: ${opts.dir}`);
+  }
+
+  // findBacklinkGaps is a sync double-walk of the brain dir. On 50K-page
+  // brains that can take seconds — heartbeat so agents see we're working.
+  const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
+  progress.start('backlinks.scan');
+  const stopHb = startHeartbeat(progress, 'walking pages for missing back-links…');
+  let gaps: BacklinkGap[];
+  try {
+    gaps = findBacklinkGaps(opts.dir);
+  } finally {
+    stopHb();
+    progress.finish();
+  }
+  const pagesAffected = new Set(gaps.map(g => g.targetPage)).size;
+
+  if (opts.action === 'fix' && gaps.length > 0) {
+    const fixed = fixBacklinkGaps(opts.dir, gaps, !!opts.dryRun);
+    return { action: 'fix', gaps_found: gaps.length, fixed, pages_affected: pagesAffected, dryRun: !!opts.dryRun };
+  }
+  return { action: opts.action, gaps_found: gaps.length, fixed: 0, pages_affected: pagesAffected, dryRun: !!opts.dryRun };
+}
+
 export async function runBacklinks(args: string[]) {
   const subcommand = args[0];
   const dirIdx = args.indexOf('--dir');
@@ -183,19 +255,25 @@ export async function runBacklinks(args: string[]) {
     process.exit(1);
   }
 
-  if (!existsSync(brainDir)) {
-    console.error(`Directory not found: ${brainDir}`);
+  let result: BacklinksResult;
+  try {
+    result = await runBacklinksCore({
+      action: subcommand as 'check' | 'fix',
+      dir: brainDir,
+      dryRun,
+    });
+  } catch (e) {
+    console.error(e instanceof Error ? e.message : String(e));
     process.exit(1);
   }
 
-  const gaps = findBacklinkGaps(brainDir);
-
-  if (gaps.length === 0) {
+  if (result.gaps_found === 0) {
     console.log('No missing back-links found.');
     return;
   }
-
-  if (subcommand === 'check') {
+  if (result.action === 'check') {
+    // Re-walk for user-facing output (core returns counts, CLI shows detail).
+    const gaps = findBacklinkGaps(brainDir);
     console.log(`Found ${gaps.length} missing back-link(s):\n`);
     for (const gap of gaps) {
       console.log(`  ${gap.targetPage} <- ${gap.sourcePage}`);
@@ -203,10 +281,9 @@ export async function runBacklinks(args: string[]) {
     }
     console.log(`\nRun 'gbrain check-backlinks fix --dir ${brainDir}' to create them.`);
   } else {
-    const label = dryRun ? '(dry run) ' : '';
-    const fixed = fixBacklinkGaps(brainDir, gaps, dryRun);
-    console.log(`${label}Fixed ${fixed} missing back-link(s) across ${new Set(gaps.map(g => g.targetPage)).size} page(s).`);
-    if (dryRun) {
+    const label = result.dryRun ? '(dry run) ' : '';
+    console.log(`${label}Fixed ${result.fixed} missing back-link(s) across ${result.pages_affected} page(s).`);
+    if (result.dryRun) {
       console.log('\nRe-run without --dry-run to apply.');
     }
   }
