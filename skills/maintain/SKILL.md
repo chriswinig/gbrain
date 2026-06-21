@@ -1,3 +1,8 @@
+---
+name: maintain
+description: "Periodic brain health checks and cleanup."
+---
+
 # Maintain Skill
 
 Periodic brain health checks and cleanup.

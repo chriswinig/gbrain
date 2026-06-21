@@ -1,3 +1,8 @@
+---
+name: enrich
+description: "Enrich person and company pages from external sources. Scale effort to importance."
+---
+
 # Enrich Skill
 
 Enrich person and company pages from external sources. Scale effort to importance.

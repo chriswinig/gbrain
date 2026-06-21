@@ -1,3 +1,8 @@
+---
+name: ingest
+description: "Ingest meetings, articles, media, documents, and conversations into the brain."
+---
+
 # Ingest Skill
 
 Ingest meetings, articles, media, documents, and conversations into the brain.

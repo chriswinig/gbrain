@@ -1,3 +1,8 @@
+---
+name: setup
+description: "Set up GBrain from scratch. Target: working brain in under 5 minutes."
+---
+
 # Setup GBrain
 
 Set up GBrain from scratch. Target: working brain in under 5 minutes.

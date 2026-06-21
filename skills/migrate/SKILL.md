@@ -1,3 +1,8 @@
+---
+name: migrate
+description: "Universal migration from any wiki, note tool, or brain system into GBrain."
+---
+
 # Migrate Skill
 
 Universal migration from any wiki, note tool, or brain system into GBrain.

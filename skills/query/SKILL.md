@@ -1,3 +1,8 @@
+---
+name: query
+description: "Answer questions using the brain's knowledge with 3-layer search and synthesis."
+---
+
 # Query Skill
 
 Answer questions using the brain's knowledge with 3-layer search and synthesis.

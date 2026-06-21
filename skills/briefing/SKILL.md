@@ -1,3 +1,8 @@
+---
+name: briefing
+description: "Compile a daily briefing from brain context."
+---
+
 # Briefing Skill
 
 Compile a daily briefing from brain context.

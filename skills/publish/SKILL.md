@@ -1,3 +1,8 @@
+---
+name: publish
+description: "Share brain pages as beautiful, self-contained HTML documents. Optionally"
+---
+
 # Publish Skill
 
 Share brain pages as beautiful, self-contained HTML documents. Optionally
