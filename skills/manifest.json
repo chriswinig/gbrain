@@ -42,6 +42,11 @@
       "name": "publish",
       "path": "publish/SKILL.md",
       "description": "Share brain pages as beautiful password-protected HTML (code + skill pair, zero LLM calls)"
+    },
+    {
+      "name": "install",
+      "path": "install/SKILL.md",
+      "description": "Deprecated alias for setup; retained for resolver compatibility"
     }
   ],
   "dependencies": {

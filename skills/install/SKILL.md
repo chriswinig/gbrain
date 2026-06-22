@@ -1,6 +1,10 @@
 ---
 name: install
 description: "This skill has been replaced by the **setup** skill. See `skills/setup/SKILL.md`."
+triggers:
+  - install
+  - update
+  - deprecated setup alias
 ---
 
 # Install GBrain (Deprecated)

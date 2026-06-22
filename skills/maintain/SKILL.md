@@ -1,6 +1,14 @@
 ---
 name: maintain
 description: "Periodic brain health checks and cleanup."
+triggers:
+  - maintain
+  - doctor
+  - health
+  - embed
+  - graph
+  - cleanup
+  - lint
 ---
 
 # Maintain Skill

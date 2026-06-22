@@ -1,6 +1,13 @@
 ---
 name: migrate
 description: "Universal migration from any wiki, note tool, or brain system into GBrain."
+triggers:
+  - migrate
+  - import
+  - obsidian
+  - notion
+  - csv
+  - json
 ---
 
 # Migrate Skill

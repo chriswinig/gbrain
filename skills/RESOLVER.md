@@ -14,9 +14,11 @@ This is the top-level dispatcher for the personal GBrain skill pack. Read the re
 | Migrate from other note systems | `skills/migrate/SKILL.md` |
 | Publish/share brain pages | `skills/publish/SKILL.md` |
 | Briefing or daily context | `skills/briefing/SKILL.md` |
-| Install/update skill packs | `skills/install/SKILL.md` |
+| Deprecated install/update alias only | `skills/install/SKILL.md` |
 
 ## Rules
+
+- Prefer `setup` for new configuration/init work; use `install` only when the request explicitly concerns the deprecated install alias.
 
 - Prefer the most specific matching skill.
 - Chain skills when a task spans ingest → enrich → maintain.

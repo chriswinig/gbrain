@@ -1,6 +1,10 @@
 ---
 name: setup
 description: "Set up GBrain from scratch. Target: working brain in under 5 minutes."
+triggers:
+  - setup
+  - configure
+  - initialize
 ---
 
 # Setup GBrain
@@ -84,6 +88,10 @@ If the user already has Postgres with pgvector:
 If the connection fails with ECONNREFUSED and the URL contains `supabase.co`,
 the user probably pasted the direct connection (IPv6 only). Guide them to the
 Session pooler string instead (see Phase A step 4).
+
+## Shared quality rules
+
+When setup creates starter pages or imports content, follow `skills/conventions/quality.md` and `skills/_brain-filing-rules.md` rather than inlining those rules here.
 
 ## Phase C: First Import
 
@@ -201,12 +209,10 @@ Read `docs/GBRAIN_SKILLPACK.md`. This is the reference architecture for how a
 production agent uses gbrain: the brain-agent loop, entity detection, enrichment
 pipeline, meeting ingestion, cron schedules, and the five operational disciplines.
 
-Inject the key patterns into the agent's system context or AGENTS.md:
+Inject the key patterns into the agent's system context or AGENTS.md by referencing the shared rules instead of copying them inline:
 
-1. **Brain-agent loop** (Section 2): read before responding, write after learning
-2. **Entity detection** (Section 3): spawn on every message, capture people/companies/ideas
-3. **Source attribution** (Section 7): every fact needs `[Source: ...]`
-4. **Iron law back-linking** (Section 15.4): every mention links back to the entity page
+- Brain-agent loop and entity detection: `docs/GBRAIN_SKILLPACK.md`
+- Filing, source attribution, and back-linking: `skills/conventions/quality.md` plus `skills/_brain-filing-rules.md`
 
 Tell the user: "The production agent guide is at docs/GBRAIN_SKILLPACK.md. It covers
 the brain-agent loop, entity detection, enrichment, meeting ingestion, and cron

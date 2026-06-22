@@ -1,6 +1,13 @@
 ---
 name: query
 description: "Answer questions using the brain's knowledge with 3-layer search and synthesis."
+triggers:
+  - ask
+  - search
+  - query
+  - answer
+  - lookup
+  - find
 ---
 
 # Query Skill

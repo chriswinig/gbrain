@@ -1,6 +1,11 @@
 ---
 name: briefing
 description: "Compile a daily briefing from brain context."
+triggers:
+  - briefing
+  - daily context
+  - meeting prep
+  - summary
 ---
 
 # Briefing Skill

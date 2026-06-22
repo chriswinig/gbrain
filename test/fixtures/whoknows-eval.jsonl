@@ -1,0 +1,10 @@
+{"query": "Lune", "expected_top_3_slugs": ["people/julia", "projects/lune/content/get-lune-experimental-carousel-1-openai-image2-prompts", "projects/lune/lune"]}
+{"query": "Wingate", "expected_top_3_slugs": ["companies/okay-wingate-ltd", "people/christina-grabowsky-ma-lmft", "companies/title-wingate-ltd"]}
+{"query": "GBrain", "expected_top_3_slugs": ["projects/gbrain/gbrain-upgrade-plan-2026-04-30", "gbrain-upgrade-plan-2026-04-30", "projects/gbrain/personal-gbrain-capability-rollout-2026-05-17"]}
+{"query": "Supabase", "expected_top_3_slugs": ["companies/supabase", "companies/clearsky-pharmacy", "projects/lune/lune-supabase-hardening-2026-05-17"]}
+{"query": "Google", "expected_top_3_slugs": ["companies/wingate-ltd", "companies/clearsky-pharmacy", "companies/apple"]}
+{"query": "Chris Winig", "expected_top_3_slugs": ["people/chris-winig", "notes/chris-winig-timeline-2018-11", "people/guy-winig"]}
+{"query": "Maya", "expected_top_3_slugs": ["people/miyo-sakamaki", "people/maya-sakamaki", "projects/wingate/archive/wingate-signal-valerie-chris"]}
+{"query": "Valerie Winig", "expected_top_3_slugs": ["people/valerie-winig", "people/marlene", "people/guy-winig"]}
+{"query": "Telegram", "expected_top_3_slugs": ["people/tyler-merlini", "people/ty", "people/thomas-havrun"]}
+{"query": "crypto", "expected_top_3_slugs": ["companies/gemini", "companies/crypto-capital", "ideas/business-canvases-2026"]}
