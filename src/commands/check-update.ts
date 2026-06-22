@@ -40,11 +40,17 @@ function upgradeCommandForMethod(method: string): string {
   }
 }
 
+function updateFetchTimeoutMs(): number {
+  const parsed = Number(process.env.GBRAIN_UPDATE_TIMEOUT_MS);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return 3_000;
+}
+
 async function fetchLatestRelease(): Promise<{ tag: string; published_at: string; url: string } | null> {
   try {
     const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
       headers: { 'User-Agent': `gbrain/${VERSION}` },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(updateFetchTimeoutMs()),
     });
     if (!res.ok) return null;
     const data = await res.json() as any;
@@ -61,7 +67,7 @@ async function fetchLatestRelease(): Promise<{ tag: string; published_at: string
 async function fetchChangelog(currentVersion: string, latestVersion: string): Promise<string> {
   try {
     const res = await fetch('https://raw.githubusercontent.com/garrytan/gbrain/master/CHANGELOG.md', {
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(updateFetchTimeoutMs()),
     });
     if (!res.ok) return '';
     const text = await res.text();

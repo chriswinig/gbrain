@@ -1,6 +1,8 @@
 import { describe, test, expect } from 'bun:test';
 import { parseSemver, isMinorOrMajorBump, extractChangelogBetween } from '../src/commands/check-update.ts';
 
+const FAST_UPDATE_ENV = { ...process.env, GBRAIN_UPDATE_TIMEOUT_MS: '1000' };
+
 describe('parseSemver', () => {
   test('parses standard version', () => {
     expect(parseSemver('0.4.0')).toEqual([0, 4, 0]);
@@ -146,6 +148,7 @@ describe('check-update CLI', () => {
       cwd: new URL('..', import.meta.url).pathname,
       stdout: 'pipe',
       stderr: 'pipe',
+      env: FAST_UPDATE_ENV,
     });
     const stdout = await new Response(proc.stdout).text();
     const exitCode = await proc.exited;

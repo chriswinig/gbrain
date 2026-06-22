@@ -11,6 +11,8 @@ import { describe, test, expect } from 'bun:test';
 import { VERSION } from '../../src/version.ts';
 import { isMinorOrMajorBump } from '../../src/commands/check-update.ts';
 
+const FAST_UPDATE_ENV = { ...process.env, GBRAIN_UPDATE_TIMEOUT_MS: '1000' };
+
 // Check if we can reach GitHub
 async function hasNetwork(): Promise<boolean> {
   try {
@@ -34,6 +36,7 @@ describeE2E('E2E: Check-Update', () => {
       cwd: new URL('../..', import.meta.url).pathname,
       stdout: 'pipe',
       stderr: 'pipe',
+      env: FAST_UPDATE_ENV,
     });
     const stdout = await new Response(proc.stdout).text();
     const exitCode = await proc.exited;
@@ -51,6 +54,7 @@ describeE2E('E2E: Check-Update', () => {
       cwd: new URL('../..', import.meta.url).pathname,
       stdout: 'pipe',
       stderr: 'pipe',
+      env: FAST_UPDATE_ENV,
     });
     const stdout = await new Response(proc.stdout).text();
     const exitCode = await proc.exited;
@@ -78,6 +82,7 @@ describeE2E('E2E: Check-Update', () => {
       cwd: new URL('../..', import.meta.url).pathname,
       stdout: 'pipe',
       stderr: 'pipe',
+      env: FAST_UPDATE_ENV,
     });
     const stdout = await new Response(proc.stdout).text();
     const exitCode = await proc.exited;
