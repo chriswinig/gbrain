@@ -698,8 +698,8 @@ jobs:
           tail -40 claude-plugin-door.txt
           if [ "$EXIT" -ne 0 ]; then exit "$EXIT"; fi
           pass_count=$(grep -Eo '[0-9]+ pass' claude-plugin-door.txt | tail -1 | grep -Eo '^[0-9]+' || true)
-          if [ "${pass_count:-0}" -ne 1 ]; then
-            echo "::error::claude plugin door expected exactly 1 passing INSTALL test, summary shows '${pass_count:-none}' — refusing to go green (re-pin deliberately when tests are added)" >&2
+          if [ "${pass_count:-0}" -ne 2 ]; then
+            echo "::error::claude plugin door expected exactly 2 passing VALIDATE/INSTALL tests, summary shows '${pass_count:-none}' — refusing to go green (re-pin deliberately when tests are added)" >&2
             exit 1
           fi
 
