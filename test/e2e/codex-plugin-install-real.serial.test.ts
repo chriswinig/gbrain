@@ -126,14 +126,20 @@ async function mcpToolCallProbe(opts: {
     { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: opts.tool, arguments: opts.params } },
   ];
   proc.stdin.write(frames.map((f) => JSON.stringify(f)).join('\n') + '\n');
-  await proc.stdin.end();
+  const stderrDone = new Response(proc.stderr).text();
   const reader = proc.stdout.getReader();
   const decoder = new TextDecoder();
   let buf = '';
   const deadline = Date.now() + (opts.timeoutMs ?? 90_000);
+  const readOrTimeout = () => Promise.race([
+    reader.read(),
+    new Promise<{ done: true; value: undefined }>((res) =>
+      setTimeout(() => res({ done: true, value: undefined }), Math.max(0, deadline - Date.now())),
+    ),
+  ]);
   try {
     while (Date.now() < deadline) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readOrTimeout();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       for (const line of buf.split('\n').slice(0, -1)) {
@@ -148,8 +154,12 @@ async function mcpToolCallProbe(opts: {
       }
       buf = buf.slice(buf.lastIndexOf('\n') + 1);
     }
-    throw new Error('mcpToolCallProbe: no response before deadline');
+    const stderr = await stderrDone.catch(() => '');
+    throw new Error(
+      `mcpToolCallProbe: no response within ${opts.timeoutMs ?? 90_000}ms — stderr:\n${stderr.slice(0, 2000)}`,
+    );
   } finally {
+    try { await proc.stdin.end(); } catch { /* already closed */ }
     try { proc.kill(); } catch { /* dead */ }
   }
 }

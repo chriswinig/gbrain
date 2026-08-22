@@ -12,8 +12,8 @@ file, the workflow pins, and the affected assertions together.
   version stamp; CI installs the RELEASE TAG `v2026.8.3` = commit `3c27eb62` — the two
   differ by post-release main commits, same declared version. If a CI door run ever
   diverges from these notes, re-observe against the tag checkout.)
-- Installer sha256: `868ed3a91e0fabbff6d7418b3ede82bf4833652ec4e77196a42852fb35a9e5b9`
-  (refreshed 2026-08-15: upstream installer drifted past the prior pin —
+- Installer sha256: `0582d9b1562efcb6e0ac62f4451021667830b830a72ce7d91eaea9fee8b6c09b`
+  (refreshed 2026-08-22: upstream installer drifted past the prior pin —
   reviewed; the `--commit` payload-pin path the door depends on is intact,
   and the payload pins (tag+commit) are unchanged)
   (download https://hermes-agent.nousresearch.com/install.sh to a file first; verify; then run)
@@ -96,7 +96,7 @@ non-interactive. `hermes cron tick` = run due jobs once and exit. `hermes cron l
   `git -C ~/.hermes/hermes-agent rev-parse HEAD` and loud-fails on any mismatch, so an
   installer that silently ignores unknown flags (or a moved checkout layout) can never
   run unpinned upstream code on a runner that later holds secrets.
-- `HERMES_INSTALL_SHA256: "868ed3a91e0fabbff6d7418b3ede82bf4833652ec4e77196a42852fb35a9e5b9"`
+- `HERMES_INSTALL_SHA256: "0582d9b1562efcb6e0ac62f4451021667830b830a72ce7d91eaea9fee8b6c09b"`
 - Door test asserts `hermes --version` output contains `v$HERMES_VERSION` when the env var is set.
 - `hermes --version` output shape: `Hermes Agent v0.20.0 (2026.8.3)` + install dir + python lines.
 

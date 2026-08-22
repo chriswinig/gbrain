@@ -139,7 +139,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
     const { runner } = makeClaudeRunner();
     const { result, err } = await withEnv(envFor(), () =>
       capture(() =>
-        runBootstrap(['harness', '--yes', '--port', String(PORT), '--harness', 'codex'], { runner }),
+        runBootstrap(['harness', '--yes', '--port', String(PORT), '--harness', 'codex'], { runner, detectClaude: () => true }),
       ),
     );
     expect(result).toBe(1);
@@ -159,7 +159,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
             '--token', token,
             '--gbrain-bin', '/opt/fake/gbrain',
           ],
-          { runner },
+          { runner, detectClaude: () => true },
         ),
       ),
     );
@@ -203,7 +203,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
   test('--status: live probes, token recovered from the codex block, exit 0', async () => {
     const { runner } = makeClaudeRunner();
     const { result, out } = await withEnv(envFor(), () =>
-      capture(() => runBootstrap(['harness', '--status'], { runner })),
+      capture(() => runBootstrap(['harness', '--status'], { runner, detectClaude: () => true })),
     );
     expect(result).toBe(0);
     expect(out).toMatch(/serve: OK/);
@@ -213,7 +213,7 @@ describe('bootstrap harness lifecycle E2E (PGLite + real serve --http)', () => {
   test('--remove: host wiring cleared, codex config byte-identical to pre-apply, receipt consumed', async () => {
     const { runner } = makeClaudeRunner();
     const { result } = await withEnv(envFor(), () =>
-      capture(() => runBootstrap(['harness', '--remove', '--yes'], { runner })),
+      capture(() => runBootstrap(['harness', '--remove', '--yes'], { runner, detectClaude: () => true })),
     );
     expect(result).toBe(0);
     expect(readFileSync(codexConfig(), 'utf8')).toBe('# preexisting codex config\nmodel = "o5"\n');

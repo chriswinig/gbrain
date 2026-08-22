@@ -173,7 +173,6 @@ run_interview() {
 - meeting prep" --workspace "$ws" > /dev/null
   gbrain bootstrap interview --set PRINCIPAL_CONTEXT "Runs a small research group; builds internal tooling; values signal over noise." --workspace "$ws" > /dev/null
   gbrain bootstrap interview --set VOICE_REGISTER "Direct: three options, the second one wins." --workspace "$ws" > /dev/null
-  gbrain bootstrap interview --set MCP_SCOPE "project" --workspace "$ws" > /dev/null
   gbrain bootstrap interview --set HOOKS_CONSENT "no" --workspace "$ws" > /dev/null
   gbrain bootstrap interview --set PERSIST_CRON "no" --workspace "$ws" > /dev/null
   hash="$(gbrain bootstrap interview --status --workspace "$ws" | sed -n 's/.*read-back hash: \([0-9a-f][0-9a-f]*\).*/\1/p')"

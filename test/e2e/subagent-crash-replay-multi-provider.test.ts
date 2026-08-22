@@ -25,7 +25,7 @@
  * Vercel AI SDK, but each provider returns slightly different response
  * shapes (provider id, finishReason mapping, usage field names, content
  * block ordering). We stub the second-turn response with provider-specific
- * shapes to prove the reconciler handles all five without leaking
+ * shapes to prove the reconciler handles every loop-capable provider without leaking
  * provider-specific assumptions.
  *
  * Plan reference: ~/.claude/plans/system-instruction-you-are-working-shimmying-breeze.md
@@ -129,18 +129,6 @@ const PROVIDER_MATRIX: ProviderShape[] = [
       usage: { input_tokens: 80, output_tokens: 6, cache_read_tokens: 0, cache_creation_tokens: 0 },
       model: 'google:gemini-1.5-pro',
       providerId: 'google',
-    },
-  },
-  {
-    providerId: 'openrouter',
-    modelId: 'openrouter:anthropic/claude-sonnet-4-6',
-    finalResponse: {
-      text: 'openrouter resumed: proxied claude response',
-      blocks: [{ type: 'text', text: 'openrouter resumed: proxied claude response' }] as ChatBlock[],
-      stopReason: 'end',
-      usage: { input_tokens: 50, output_tokens: 7, cache_read_tokens: 0, cache_creation_tokens: 0 },
-      model: 'openrouter:anthropic/claude-sonnet-4-6',
-      providerId: 'openrouter',
     },
   },
   {

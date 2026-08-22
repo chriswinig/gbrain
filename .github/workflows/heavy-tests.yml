@@ -23,6 +23,10 @@ on:
         description: 'Run the grok-door job (pre-secret posture: label or this input only)'
         type: boolean
         default: false
+      run_hermes_door:
+        description: 'Run the paid Hermes door (requires ANTHROPIC_API_KEY secret)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -186,16 +190,17 @@ jobs:
   # Hermes door e2e: unlike real-agent-e2e above (best-effort, self-skipping),
   # this job PROVISIONS the real hermes binary itself — pinned installer digest,
   # non-interactive auth + model pin — and then requires the door tests to
-  # actually execute. It pays real API cost, so it stays label-gated at heavy
-  # cadence (nightly + `real-agent-e2e`/`heavy-tests` label + dispatch); NEVER
-  # the PR shard matrix. Loud-fail throughout: a runner that cannot install or
-  # auth hermes fails this job rather than skipping.
+  # actually execute. It pays real API cost, so before ANTHROPIC_API_KEY exists
+  # it is explicit opt-in only: `real-agent-e2e` PR label or the dispatch input.
+  # Loud-fail throughout once selected: a runner that cannot install or auth
+  # hermes fails this job rather than skipping.
   hermes-door:
     name: Hermes door e2e (real binary, loud-fail)
     if: |
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
-      contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'real-agent-e2e')) ||
+      (github.event_name == 'workflow_dispatch' &&
+        inputs.run_hermes_door == true)
     runs-on: ubuntu-latest
     # Four serial door tests at 600s each plus the installer budget cannot
     # fit the sibling job's 20 minutes.
@@ -210,7 +215,7 @@ jobs:
       HERMES_VERSION: "0.20.0"
       HERMES_GIT_TAG: "v2026.8.3"
       HERMES_GIT_COMMIT: "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
-      HERMES_INSTALL_SHA256: "868ed3a91e0fabbff6d7418b3ede82bf4833652ec4e77196a42852fb35a9e5b9"
+      HERMES_INSTALL_SHA256: "0582d9b1562efcb6e0ac62f4451021667830b830a72ce7d91eaea9fee8b6c09b"
       GBRAIN_REAL_HERMES_E2E: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -706,10 +711,9 @@ jobs:
   # DAY-ONE FULL POSTURE (a step past grok's pre-secret gating, deliberate):
   # opencode's anonymous free tier drives MCP tool calls keyless (observed,
   # load-bearing — OPENCODE-CLI-PIN.md §One-shot), so the ENTIRE core door —
-  # including the nonce SMOKE — runs with no secret; and the paid anthropic
-  # leg rides the ANTHROPIC_API_KEY secret that already exists (hermes-door
-  # consumes it). So this job takes the hermes-door triggers (nightly +
-  # labels + dispatch, cadence policy: nightly for the NEWEST door agent)
+  # including the nonce SMOKE — runs with no secret; the paid anthropic leg
+  # runs only when ANTHROPIC_API_KEY exists. So this job keeps nightly +
+  # labels + dispatch for its free, deterministic coverage
   # with grok-door's internals (keyless-first ordering, secretless pinned
   # provisioning, sentinels, scrub triple, unconditional credential removal).
   # No dedicated dispatch input: any workflow_dispatch already passes the
@@ -831,19 +835,23 @@ jobs:
             exit 1
           fi
 
-      - name: Preconditions (secret present)
+      - name: Check optional paid-tier secret
+        id: anthropic
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::error::ANTHROPIC_API_KEY secret is empty — the keyless tier above already ran (its coverage, including the SMOKE, is banked); the paid anthropic leg needs the secret hermes-door already consumes. Fork PRs get no secrets from GitHub." >&2
-            exit 1
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "SKIP: ANTHROPIC_API_KEY is absent — keyless opencode coverage, including the SMOKE, already passed."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Full run (paid anthropic leg included). The T5 models-gate inside the
       # suite is the named bad-pin tripwire: it validates the pinned model id
       # against the AUTHED `opencode models` list BEFORE any spend.
       - name: Run opencode door tests (full — paid anthropic leg included)
+        if: steps.anthropic.outputs.available == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
