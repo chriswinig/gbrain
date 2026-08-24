@@ -3198,8 +3198,11 @@ See also:
       }
       process.exit(worstExit);
     }
-    const sourceArg = args.find((a, i) => args[i - 1] === '--source');
-    const sourceId = sourceArg ?? 'default';
+    // Match normal sync's source routing. A brain with one non-default source
+    // must repair that source's lock, not silently target the seeded `default`.
+    const sourceArg = args.find((a, i) => args[i - 1] === '--source') || null;
+    const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
+    const sourceId = (await resolveSourceWithTier(engine, sourceArg)).source_id;
     const lockKey = `gbrain-sync:${sourceId}`;
     const exit = await runBreakLock(engine, lockKey, sourceId, {
       force: forceBreakLock,
